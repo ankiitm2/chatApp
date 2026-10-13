@@ -39,8 +39,8 @@ function match(me) {
   partners.set(me.id, other.id);
   partners.set(other.id, me.id);
   const common = me.interests.filter((i) => other.interests.includes(i));
-  io.to(me.id).emit("matched", { nick: other.nick, common, isInitiator: true });
-  io.to(other.id).emit("matched", { nick: me.nick, common, isInitiator: false });
+  io.to(me.id).emit("matched", { nick: other.nick, gender: other.gender, common, isInitiator: true });
+  io.to(other.id).emit("matched", { nick: me.nick, gender: me.gender, common, isInitiator: false });
 }
 
 let onlineCount = 0;
@@ -49,16 +49,18 @@ io.on("connection", (socket) => {
   onlineCount++;
   io.emit("online-count", onlineCount);
 
-  socket.on("find", ({ nick, interests }) => {
+  socket.on("find", ({ nick, gender, interests }) => {
     unpair(socket.id);
     dequeue(socket.id);
     const clean = (Array.isArray(interests) ? interests : [])
       .map((i) => String(i).trim().toLowerCase().slice(0, 24))
       .filter(Boolean)
       .slice(0, 5);
+    const validGender = gender === "female" ? "female" : gender === "male" ? "male" : "other";
     match({
       id: socket.id,
       nick: String(nick || "Stranger").trim().slice(0, 20) || "Stranger",
+      gender: validGender,
       interests: clean,
     });
   });
@@ -74,6 +76,41 @@ io.on("connection", (socket) => {
     const p = partners.get(socket.id);
     if (p) {
       io.to(p).emit("video-state", state);
+    }
+  });
+
+  socket.on("call-request", (data) => {
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("call-request", data);
+    }
+  });
+
+  socket.on("call-cancel", () => {
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("call-cancel");
+    }
+  });
+
+  socket.on("call-response", (data) => {
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("call-response", data);
+    }
+  });
+
+  socket.on("friend-request", (senderInfo) => {
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("friend-request", senderInfo);
+    }
+  });
+
+  socket.on("friend-accept", (acceptInfo) => {
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("friend-accept", acceptInfo);
     }
   });
 

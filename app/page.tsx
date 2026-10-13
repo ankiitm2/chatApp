@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 
 type Phase = "setup" | "waiting" | "chat" | "ended";
+type Gender = "male" | "female" | "other";
 type Msg = { mine: boolean; text: string; time: string };
 
 const ICE_SERVERS = {
@@ -23,15 +24,27 @@ export default function Home() {
 
   const [phase, setPhase] = useState<Phase>("setup");
   const [nick, setNick] = useState("");
+  const [gender, setGender] = useState<Gender>("male");
   const [interests, setInterests] = useState("");
+
   const [partner, setPartner] = useState("");
+  const [partnerGender, setPartnerGender] = useState<Gender>("male");
   const [common, setCommon] = useState<string[]>([]);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [draft, setDraft] = useState("");
   const [onlineCount, setOnlineCount] = useState(3425);
 
+  // Friend System states
+  const [friendStatus, setFriendStatus] = useState<"none" | "sent" | "received" | "friends">("none");
+  const [showToast, setShowToast] = useState<string | null>(null);
+
+  // Video Call Request / Calling states
+  const [outgoingCallWaiting, setOutgoingCallWaiting] = useState(false);
+  const [incomingCallRequest, setIncomingCallRequest] = useState<boolean>(false);
+
   // Video calling states
   const [isVideoActive, setIsVideoActive] = useState(false);
+  const [hasLocalMedia, setHasLocalMedia] = useState(false);
   const [remoteHasVideo, setRemoteHasVideo] = useState(false);
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isCamOff, setIsCamOff] = useState(false);
@@ -56,10 +69,14 @@ export default function Home() {
       remoteVideoRef.current.srcObject = null;
     }
     setIsVideoActive(false);
+    setHasLocalMedia(false);
     setRemoteHasVideo(false);
     setIsMicMuted(false);
     setIsCamOff(false);
     setVideoError(null);
+    setFriendStatus("none");
+    setOutgoingCallWaiting(false);
+    setIncomingCallRequest(false);
   }, []);
 
   const createPeerConnection = useCallback(() => {
@@ -82,6 +99,65 @@ export default function Home() {
     return pc;
   }, []);
 
+  // Gracefully obtain media stream (handles no camera / mic / permissions seamlessly)
+  const acquireLocalMedia = useCallback(async (): Promise<MediaStream | null> => {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    } catch {
+      try {
+        return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      } catch {
+        try {
+          return await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        } catch {
+          return null; // Both camera and mic unavailable / denied, user can still see stranger!
+        }
+      }
+    }
+  }, []);
+
+  // Actually establish WebRTC video session
+  const establishCall = useCallback(async (isCaller: boolean) => {
+    setIsVideoActive(true);
+    setOutgoingCallWaiting(false);
+    setIncomingCallRequest(false);
+
+    // Try to get local camera/mic stream
+    const stream = await acquireLocalMedia();
+    localStreamRef.current = stream;
+
+    if (stream) {
+      setHasLocalMedia(true);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+      socketRef.current?.emit("video-state", { enabled: true });
+    } else {
+      setHasLocalMedia(false);
+      setVideoError("Camera/Mic not detected or blocked on your device, but you can still view incoming video.");
+      socketRef.current?.emit("video-state", { enabled: false });
+    }
+
+    const pc = createPeerConnection();
+
+    if (stream) {
+      const senders = pc.getSenders();
+      stream.getTracks().forEach((track) => {
+        const alreadyAdded = senders.some((s) => s.track === track);
+        if (!alreadyAdded) {
+          pc.addTrack(track, stream);
+        }
+      });
+    }
+
+    if (isCaller) {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socketRef.current?.emit("signal", { sdp: pc.localDescription });
+    }
+  }, [acquireLocalMedia, createPeerConnection]);
+
+  // Mount-only Socket.IO connection
   useEffect(() => {
     const s = io();
     socketRef.current = s;
@@ -97,9 +173,10 @@ export default function Home() {
 
     s.on(
       "matched",
-      (d: { nick: string; common: string[]; isInitiator?: boolean }) => {
+      (d: { nick: string; gender?: Gender; common: string[]; isInitiator?: boolean }) => {
         cleanupMediaAndPeer();
         setPartner(d.nick);
+        setPartnerGender(d.gender || "male");
         setCommon(d.common);
         setMsgs([]);
         setPhase("chat");
@@ -113,6 +190,45 @@ export default function Home() {
         .toString()
         .padStart(2, "0")}`;
       setMsgs((m) => [...m, { mine: false, text, time: timeStr }]);
+    });
+
+    // Call request received from stranger
+    s.on("call-request", () => {
+      setIncomingCallRequest(true);
+      setShowToast("Incoming Video Call request!");
+    });
+
+    // Call request cancelled by stranger
+    s.on("call-cancel", () => {
+      setIncomingCallRequest(false);
+      setShowToast("Call was cancelled by stranger.");
+      setTimeout(() => setShowToast(null), 3000);
+    });
+
+    // Call response received from stranger
+    s.on("call-response", async (response: { accepted: boolean }) => {
+      setOutgoingCallWaiting(false);
+      if (response.accepted) {
+        setShowToast("Stranger accepted your video call! 🎥");
+        setTimeout(() => setShowToast(null), 4000);
+        await establishCall(true); // Initiate offer
+      } else {
+        setShowToast("Stranger declined the video call.");
+        setTimeout(() => setShowToast(null), 4000);
+      }
+    });
+
+    // Friend requests
+    s.on("friend-request", () => {
+      setFriendStatus("received");
+      setShowToast("Stranger sent you a friend request!");
+      setTimeout(() => setShowToast(null), 5000);
+    });
+
+    s.on("friend-accept", () => {
+      setFriendStatus("friends");
+      setShowToast("You and Stranger are now friends! 🎉");
+      setTimeout(() => setShowToast(null), 5000);
     });
 
     s.on("video-state", async (state: { enabled: boolean }) => {
@@ -159,7 +275,7 @@ export default function Home() {
       cleanupMediaAndPeer();
       s.disconnect();
     };
-  }, [cleanupMediaAndPeer, createPeerConnection]);
+  }, []); // Run ONLY once on mount
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -170,6 +286,7 @@ export default function Home() {
     setPhase("waiting");
     socketRef.current?.emit("find", {
       nick,
+      gender,
       interests: interests.split(",").map((i) => i.trim()).filter(Boolean),
     });
   };
@@ -199,69 +316,49 @@ export default function Home() {
     setDraft("");
   };
 
-  // Start Video Calling with fallbacks
-  const startVideo = async () => {
-    try {
-      setVideoError(null);
-      let stream: MediaStream;
+  // Friend actions
+  const sendFriendRequest = () => {
+    socketRef.current?.emit("friend-request", { nick, gender });
+    setFriendStatus("sent");
+    setShowToast("Friend request sent!");
+    setTimeout(() => setShowToast(null), 3000);
+  };
 
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
-      } catch (firstErr: unknown) {
-        console.warn("Retrying media fallback...", firstErr);
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: false,
-          });
-        } catch {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              video: false,
-              audio: true,
-            });
-          } catch {
-            throw firstErr;
-          }
-        }
-      }
+  const acceptFriendRequest = () => {
+    socketRef.current?.emit("friend-accept", { nick, gender });
+    setFriendStatus("friends");
+    setShowToast(`You and ${partner || "Stranger"} are now friends! 🎉`);
+    setTimeout(() => setShowToast(null), 4000);
+  };
 
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-      setIsVideoActive(true);
-      socketRef.current?.emit("video-state", { enabled: true });
+  // Initiate a video call request to the stranger
+  const requestVideoCall = () => {
+    setOutgoingCallWaiting(true);
+    socketRef.current?.emit("call-request", { from: nick });
+    setShowToast("Calling stranger... Waiting for answer");
+  };
 
-      const pc = createPeerConnection();
-      const senders = pc.getSenders();
-      stream.getTracks().forEach((track) => {
-        const alreadyAdded = senders.some((s) => s.track === track);
-        if (!alreadyAdded) {
-          pc.addTrack(track, stream);
-        }
-      });
+  // Cancel outgoing call request
+  const cancelCallRequest = () => {
+    setOutgoingCallWaiting(false);
+    socketRef.current?.emit("call-cancel");
+    setShowToast("Call request cancelled.");
+    setTimeout(() => setShowToast(null), 3000);
+  };
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socketRef.current?.emit("signal", { sdp: pc.localDescription });
-    } catch (err: unknown) {
-      console.error("Camera error:", err);
-      const errorObj = err as { name?: string; message?: string };
-      const errName = errorObj.name || "";
-      if (errName === "NotAllowedError" || errName === "PermissionDeniedError") {
-        setVideoError("Permissions blocked. Enable camera/mic access in browser.");
-      } else if (errName === "NotFoundError") {
-        setVideoError("No camera or mic hardware detected.");
-      } else if (errName === "NotReadableError") {
-        setVideoError("Camera is currently occupied by another program or tab.");
-      } else {
-        setVideoError("Could not access camera/mic: " + (errorObj.message || "Permission issue"));
-      }
-    }
+  // Accept incoming video call request
+  const acceptVideoCall = async () => {
+    setIncomingCallRequest(false);
+    socketRef.current?.emit("call-response", { accepted: true });
+    await establishCall(false); // Receiver sets up connection
+  };
+
+  // Decline incoming video call request
+  const declineVideoCall = () => {
+    setIncomingCallRequest(false);
+    socketRef.current?.emit("call-response", { accepted: false });
+    setShowToast("Declined video call request.");
+    setTimeout(() => setShowToast(null), 3000);
   };
 
   const stopVideo = () => {
@@ -300,9 +397,76 @@ export default function Home() {
     }
   };
 
+  // Avatar icon helper
+  const renderAvatar = (gen: Gender, name: string, size = "w-10 h-10 text-base") => {
+    const initial = name ? name.slice(0, 1).toUpperCase() : (gen === "female" ? "♀" : "♂");
+    if (gen === "female") {
+      return (
+        <div className={`${size} rounded-full bg-gradient-to-tr from-pink-500 via-rose-500 to-purple-500 flex items-center justify-center font-bold text-white shadow-md shadow-pink-500/20 ring-2 ring-pink-400/30`}>
+          <span>👩</span>
+        </div>
+      );
+    }
+    if (gen === "male") {
+      return (
+        <div className={`${size} rounded-full bg-gradient-to-tr from-cyan-600 via-blue-600 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-cyan-500/20 ring-2 ring-cyan-400/30`}>
+          <span>👨</span>
+        </div>
+      );
+    }
+    return (
+      <div className={`${size} rounded-full bg-gradient-to-tr from-purple-600 to-violet-600 flex items-center justify-center font-bold text-white shadow-md shadow-purple-500/20 ring-2 ring-purple-400/30`}>
+        <span>{initial}</span>
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0d1117] text-slate-100 font-sans select-none">
       <div className="flex flex-col flex-1 h-full w-full max-w-[1700px] mx-auto bg-[#0f141c]">
+        {/* Toast Notification */}
+        {showToast && (
+          <div className="fixed top-4 right-4 z-50 bg-[#151e2c] border border-cyan-500/40 text-cyan-200 px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 animate-bounce">
+            <span>✨</span>
+            <span className="text-xs font-medium">{showToast}</span>
+          </div>
+        )}
+
+        {/* Incoming Call Dialog Modal */}
+        {incomingCallRequest && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+            <div className="w-full max-w-sm rounded-2xl bg-[#141b27] border border-[#233147] p-6 text-center space-y-5 shadow-2xl animate-in zoom-in-95">
+              <div className="relative w-20 h-20 mx-auto">
+                <div className="absolute inset-0 rounded-full border-4 border-emerald-500/30 animate-ping"></div>
+                {renderAvatar(partnerGender, partner, "w-20 h-20 text-3xl")}
+              </div>
+
+              <div className="space-y-1">
+                <h3 className="text-lg font-bold text-white">{partner || "Stranger"} is calling you...</h3>
+                <p className="text-xs text-slate-400">Incoming Video Call request. Camera will be optional.</p>
+              </div>
+
+              <div className="flex items-center gap-3 pt-2">
+                <button
+                  onClick={declineVideoCall}
+                  className="flex-1 py-2.5 px-4 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-300 font-semibold text-xs transition-colors cursor-pointer"
+                >
+                  Decline
+                </button>
+                <button
+                  onClick={acceptVideoCall}
+                  className="flex-1 py-2.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-semibold text-xs shadow-lg shadow-emerald-500/25 transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
+                  </svg>
+                  <span>Accept Call</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Top Navbar */}
         <header className="h-16 px-6 flex items-center justify-between border-b border-[#1c2433] bg-[#0c1017]">
           {/* Logo */}
@@ -332,7 +496,7 @@ export default function Home() {
                 <button
                   onClick={stopVideo}
                   title="Hang Up Video"
-                  className="w-8 h-8 rounded-full bg-rose-500/20 border border-rose-500/40 flex items-center justify-center text-rose-400 hover:bg-rose-500 hover:text-white transition-colors"
+                  className="w-8 h-8 rounded-full bg-rose-500/20 border border-rose-500/40 flex items-center justify-center text-rose-400 hover:bg-rose-500 hover:text-white transition-colors cursor-pointer"
                 >
                   <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.99.99 0 010-1.41C2.38 9.61 6.89 8 12 8s9.62 1.61 11.71 3.67c.39.39.39 1.02 0 1.41l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.1-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z" />
@@ -341,14 +505,12 @@ export default function Home() {
               </div>
             )}
 
-            <button className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-[#1a2332] transition-colors">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
-            <div className="w-8 h-8 rounded-full bg-gradient-to-r from-purple-500 to-indigo-600 flex items-center justify-center ring-2 ring-[#222e40] text-xs font-bold text-white">
-              {nick ? nick.slice(0, 2).toUpperCase() : "ME"}
+            {/* User Profile Pill */}
+            <div className="flex items-center gap-2 px-2.5 py-1 rounded-full bg-[#141c27] border border-[#232f41]">
+              {renderAvatar(gender, nick, "w-6 h-6 text-xs")}
+              <span className="text-xs font-semibold text-slate-200">
+                {nick || "You"}
+              </span>
             </div>
           </div>
         </header>
@@ -356,7 +518,7 @@ export default function Home() {
         {/* SETUP PHASE SCREEN */}
         {phase === "setup" && (
           <div className="flex-1 flex flex-col items-center justify-center p-6 bg-radial from-[#151c28] via-[#0d1118] to-[#0a0d13]">
-            <div className="w-full max-w-md p-8 rounded-2xl bg-[#131923] border border-[#202b3d] shadow-2xl space-y-6">
+            <div className="w-full max-w-md p-8 rounded-2xl bg-[#131923] border border-[#202b3d] shadow-2xl space-y-5">
               <div className="text-center space-y-2">
                 <div className="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/25">
                   <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -371,8 +533,8 @@ export default function Home() {
                 <div>
                   <label className="text-xs font-medium text-slate-300 block mb-1.5">Your Nickname</label>
                   <input
-                    className="w-full rounded-xl bg-[#0b0e14] border border-[#232e42] px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-cyan-500 transition-colors"
-                    placeholder="Enter nickname (e.g. Alex, NeonSurfer)"
+                    className="w-full rounded-xl bg-[#0b0e14] border border-[#232e42] px-4 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-cyan-500 transition-colors"
+                    placeholder="Enter nickname (e.g. Alex, Maya)"
                     maxLength={20}
                     value={nick}
                     onChange={(e) => setNick(e.target.value)}
@@ -380,10 +542,52 @@ export default function Home() {
                 </div>
 
                 <div>
+                  <label className="text-xs font-medium text-slate-300 block mb-1.5">I am</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setGender("male")}
+                      className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        gender === "male"
+                          ? "bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-md shadow-cyan-500/20"
+                          : "bg-[#0b0e14] border-[#232e42] text-slate-400 hover:border-slate-600"
+                      }`}
+                    >
+                      <span>👨</span>
+                      <span>Male</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setGender("female")}
+                      className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        gender === "female"
+                          ? "bg-pink-500/20 border-pink-400 text-pink-300 shadow-md shadow-pink-500/20"
+                          : "bg-[#0b0e14] border-[#232e42] text-slate-400 hover:border-slate-600"
+                      }`}
+                    >
+                      <span>👩</span>
+                      <span>Female</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setGender("other")}
+                      className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        gender === "other"
+                          ? "bg-purple-500/20 border-purple-400 text-purple-300 shadow-md shadow-purple-500/20"
+                          : "bg-[#0b0e14] border-[#232e42] text-slate-400 hover:border-slate-600"
+                      }`}
+                    >
+                      <span>✨</span>
+                      <span>Other</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div>
                   <label className="text-xs font-medium text-slate-300 block mb-1.5">Interests / Tags</label>
                   <input
-                    className="w-full rounded-xl bg-[#0b0e14] border border-[#232e42] px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-cyan-500 transition-colors"
-                    placeholder="e.g. music, gaming, movies, anime"
+                    className="w-full rounded-xl bg-[#0b0e14] border border-[#232e42] px-4 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-cyan-500 transition-colors"
+                    placeholder="e.g. music, gaming, anime, coding"
                     value={interests}
                     onChange={(e) => setInterests(e.target.value)}
                   />
@@ -391,7 +595,7 @@ export default function Home() {
 
                 <button
                   onClick={find}
-                  className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-semibold text-sm shadow-lg shadow-emerald-500/25 hover:from-emerald-400 hover:to-teal-400 transition-all cursor-pointer flex items-center justify-center gap-2"
+                  className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-semibold text-sm shadow-lg shadow-emerald-500/25 hover:from-emerald-400 hover:to-teal-400 transition-all cursor-pointer flex items-center justify-center gap-2 mt-2"
                 >
                   <span>Start Matching</span>
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
@@ -449,7 +653,6 @@ export default function Home() {
               <div className="flex-1 flex flex-col lg:flex-row overflow-hidden bg-[#0a0d14]">
                 {/* Main Video Viewport */}
                 <div className="relative flex-1 bg-black flex items-center justify-center overflow-hidden">
-                  {/* Stranger Video (Full Viewport) */}
                   <video
                     ref={remoteVideoRef}
                     autoPlay
@@ -457,30 +660,56 @@ export default function Home() {
                     className="w-full h-full object-cover"
                   />
 
-                  {/* Fallback avatar if stranger's camera isn't transmitting */}
                   {!remoteHasVideo && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-b from-[#121824] to-[#080b10] text-slate-400">
-                      <div className="w-24 h-24 rounded-full bg-[#1b2333] border-2 border-[#2b374d] flex items-center justify-center text-4xl mb-4 shadow-xl">
-                        👤
-                      </div>
+                      {renderAvatar(partnerGender, partner, "w-24 h-24 text-4xl mb-4")}
                       <h3 className="text-lg font-semibold text-white">{partner || "Stranger"}</h3>
-                      <p className="text-xs text-slate-400 mt-1">Camera is currently paused or inactive</p>
+                      <p className="text-xs text-slate-400 mt-1">Stranger&apos;s camera is off or not supported</p>
                     </div>
                   )}
 
                   {/* Top-Left Stranger Info Badge */}
-                  <div className="absolute top-4 left-4 flex items-center gap-2.5 px-3.5 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 shadow-lg">
-                    <div className="w-7 h-7 rounded-full bg-gradient-to-tr from-purple-500 to-indigo-500 flex items-center justify-center text-xs font-bold text-white">
-                      {partner ? partner.slice(0, 1).toUpperCase() : "S"}
-                    </div>
+                  <div className="absolute top-4 left-4 flex items-center gap-3 px-3.5 py-2 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 shadow-lg">
+                    {renderAvatar(partnerGender, partner, "w-8 h-8 text-sm")}
                     <div>
-                      <div className="text-xs font-semibold text-white leading-tight">
-                        {partner || "Stranger #821"}
+                      <div className="text-xs font-semibold text-white leading-tight flex items-center gap-1.5">
+                        <span>{partner || "Stranger"}</span>
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-white/10 text-slate-300 capitalize">
+                          {partnerGender}
+                        </span>
                       </div>
                       <div className="text-[10px] text-slate-300 leading-tight">
                         {common.length > 0 ? common.join(" · ") : "Video, NeonChat +10m ping"}
                       </div>
                     </div>
+
+                    {/* Friend Button inside badge */}
+                    {friendStatus === "none" && (
+                      <button
+                        onClick={sendFriendRequest}
+                        className="ml-2 px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/40 border border-cyan-400/30 text-cyan-300 text-[11px] font-medium transition-all"
+                      >
+                        + Add Friend
+                      </button>
+                    )}
+                    {friendStatus === "sent" && (
+                      <span className="ml-2 px-2.5 py-1 rounded-lg bg-slate-800 text-slate-400 text-[11px]">
+                        Request Sent
+                      </span>
+                    )}
+                    {friendStatus === "received" && (
+                      <button
+                        onClick={acceptFriendRequest}
+                        className="ml-2 px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-white text-[11px] font-semibold transition-all animate-pulse"
+                      >
+                        Accept Friend
+                      </button>
+                    )}
+                    {friendStatus === "friends" && (
+                      <span className="ml-2 px-2.5 py-1 rounded-lg bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold flex items-center gap-1">
+                        <span>✓</span> Friends
+                      </span>
+                    )}
                   </div>
 
                   {/* Picture-in-Picture (Local Camera Stream) */}
@@ -492,13 +721,13 @@ export default function Home() {
                         playsInline
                         muted
                         className={`w-full h-full object-cover -scale-x-100 ${
-                          isCamOff ? "hidden" : ""
+                          isCamOff || !hasLocalMedia ? "hidden" : ""
                         }`}
                       />
-                      {isCamOff && (
-                        <div className="w-full h-full flex flex-col items-center justify-center text-xs text-slate-400 bg-slate-900">
-                          <span className="text-2xl mb-1">📷</span>
-                          <span>Cam Off</span>
+                      {(isCamOff || !hasLocalMedia) && (
+                        <div className="w-full h-full flex flex-col items-center justify-center text-xs text-slate-400 bg-slate-900 p-2 text-center">
+                          {renderAvatar(gender, nick, "w-12 h-12 text-lg mb-2")}
+                          <span>{!hasLocalMedia ? "No Camera" : "Cam Off"}</span>
                         </div>
                       )}
                       <div className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-black/70 text-[9px] font-bold text-cyan-300 uppercase tracking-wider">
@@ -510,7 +739,6 @@ export default function Home() {
                   {/* Floating Video Control Dock */}
                   {isVideoActive && (
                     <div className="absolute bottom-5 inset-x-0 mx-auto w-fit flex items-center gap-3 px-5 py-2.5 rounded-full bg-[#111722]/80 backdrop-blur-lg border border-white/15 shadow-2xl z-20">
-                      {/* Mute Mic */}
                       <button
                         onClick={toggleMic}
                         title={isMicMuted ? "Unmute Mic" : "Mute Mic"}
@@ -522,14 +750,13 @@ export default function Home() {
                       >
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                           {isMicMuted ? (
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 19L5 5m9.5 9.5A4 4 0 0016 11V5a4 4 0 00-8 0v2m2 7a4 4 0 006 0v-2m3 2a7 7 0 01-11.83 5M12 19v3m-4 0h8" />
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 19L5 5m9.5 9.5A4 4 0 0016 11V5a4 4 0 00-8 0v2m2 7a4 4 0 01-11.83 5M12 19v3m-4 0h8" />
                           ) : (
                             <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-14 0m7 7v4m-4 0h8m-4-15a3 3 0 00-3 3v4a3 3 0 006 0V7a3 3 0 00-3-3z" />
                           )}
                         </svg>
                       </button>
 
-                      {/* Video Camera Toggle */}
                       <button
                         onClick={toggleCam}
                         title={isCamOff ? "Turn On Camera" : "Turn Off Camera"}
@@ -544,7 +771,6 @@ export default function Home() {
                         </svg>
                       </button>
 
-                      {/* Next / Skip */}
                       <button
                         onClick={next}
                         title="Skip to Next Stranger"
@@ -555,11 +781,10 @@ export default function Home() {
                         </svg>
                       </button>
 
-                      {/* End Video Call */}
                       <button
                         onClick={stopVideo}
                         title="Hang Up Video"
-                        className="w-11 h-11 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center transition-all shadow-lg shadow-rose-600/30"
+                        className="w-11 h-11 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center transition-all shadow-lg shadow-rose-600/30 cursor-pointer"
                       >
                         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                           <path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.99.99 0 010-1.41C2.38 9.61 6.89 8 12 8s9.62 1.61 11.71 3.67c.39.39.39 1.02 0 1.41l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.1-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z" />
@@ -578,7 +803,6 @@ export default function Home() {
                     <span className="text-[11px] text-slate-500">{msgs.length} messages</span>
                   </div>
 
-                  {/* Messages list */}
                   <div className="flex-1 overflow-y-auto p-4 space-y-3">
                     {msgs.map((m, i) => (
                       <div
@@ -602,7 +826,6 @@ export default function Home() {
                     <div ref={bottomRef} />
                   </div>
 
-                  {/* Input bar */}
                   <div className="p-3 border-t border-[#1a2333] bg-[#0c1017]">
                     <div className="flex items-center gap-2 bg-[#141b27] rounded-xl px-3 py-2 border border-[#222e40] focus-within:border-cyan-500 transition-colors">
                       <input
@@ -625,37 +848,65 @@ export default function Home() {
                 </div>
               </div>
             ) : (
-              /* NeonChat - Chat Home Screen (Standard layout matching Screenshot 1) */
+              /* NeonChat - Chat Home Screen */
               <div className="flex-1 flex flex-col lg:flex-row overflow-hidden bg-[#0d121a]">
-                {/* Main Text Chat Container */}
                 <div className="flex-1 flex flex-col overflow-hidden">
                   {/* Stranger Chat Top Header Bar */}
                   <div className="px-6 py-3.5 border-b border-[#18212f] bg-[#0c1017] flex items-center justify-between">
                     <div className="flex items-center gap-3">
                       <div className="relative">
-                        <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-amber-600 via-rose-500 to-indigo-600 flex items-center justify-center text-sm font-bold text-white shadow-md">
-                          {partner ? partner.slice(0, 1).toUpperCase() : "S"}
-                        </div>
+                        {renderAvatar(partnerGender, partner)}
                         <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-emerald-400 border-2 border-[#0c1017]"></span>
                       </div>
                       <div>
                         <div className="text-sm font-bold text-white flex items-center gap-2">
-                          <span>{partner || "Stranger #821"}</span>
+                          <span>{partner || "Stranger"}</span>
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#1b2434] text-slate-300 font-normal capitalize">
+                            {partnerGender}
+                          </span>
                         </div>
                         <div className="text-[11px] text-slate-400">
                           {common.length > 0 ? (
                             <span>Shared interests: {common.join(", ")}</span>
                           ) : (
-                            <span>Text chat active · 04:12</span>
+                            <span>Text chat active · Live</span>
                           )}
                         </div>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2.5">
+                      {/* Friend Button in header */}
+                      {friendStatus === "none" && (
+                        <button
+                          onClick={sendFriendRequest}
+                          className="px-3 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-300 text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <span>➕</span> Add Friend
+                        </button>
+                      )}
+                      {friendStatus === "sent" && (
+                        <span className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-400 text-xs">
+                          Request Sent
+                        </span>
+                      )}
+                      {friendStatus === "received" && (
+                        <button
+                          onClick={acceptFriendRequest}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-white text-xs font-semibold transition-all animate-pulse cursor-pointer"
+                        >
+                          Accept Friend Request
+                        </button>
+                      )}
+                      {friendStatus === "friends" && (
+                        <span className="px-3 py-1.5 rounded-lg bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex items-center gap-1">
+                          <span>✓</span> Friends
+                        </span>
+                      )}
+
                       <button
                         onClick={next}
-                        className="px-3 py-1.5 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium transition-colors"
+                        className="px-3 py-1.5 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium transition-colors cursor-pointer"
                       >
                         Next Stranger
                       </button>
@@ -678,7 +929,7 @@ export default function Home() {
                   <div className="flex-1 overflow-y-auto px-6 py-6 space-y-4">
                     <div className="text-center my-2">
                       <span className="text-[11px] text-slate-500 px-3 py-1 rounded-full bg-[#131a26] border border-[#1e283a]">
-                        Connected 5 minutes ago
+                        Connected with {partner || "Stranger"} · Say hi!
                       </span>
                     </div>
 
@@ -709,7 +960,7 @@ export default function Home() {
                         </p>
                         <button
                           onClick={next}
-                          className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shadow-md shadow-cyan-600/20 transition-all"
+                          className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shadow-md shadow-cyan-600/20 transition-all cursor-pointer"
                         >
                           Find Next Stranger
                         </button>
@@ -755,7 +1006,7 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Right Side Sidebar (Ready for more? Upgrade to Video Call) */}
+                {/* Right Side Sidebar */}
                 <div className="w-full lg:w-80 border-t lg:border-t-0 lg:border-l border-[#18212e] bg-[#0c1017] p-6 flex flex-col justify-between">
                   <div className="space-y-6">
                     {/* Upgrade to Video Card */}
@@ -769,40 +1020,56 @@ export default function Home() {
                       <div className="space-y-1.5">
                         <h3 className="text-base font-bold text-white">Ready for more?</h3>
                         <p className="text-xs text-slate-400 leading-relaxed">
-                          Upgrade to <span className="text-cyan-400 font-semibold">Video Call</span> and see who you&apos;re talking to in real time.
+                          Request a <span className="text-cyan-400 font-semibold">Video Call</span> with your partner.
                         </p>
                       </div>
 
-                      <button
-                        onClick={startVideo}
-                        className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-semibold text-xs shadow-lg shadow-emerald-500/25 transition-all flex items-center justify-center gap-2 cursor-pointer"
-                      >
-                        <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
-                          <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
-                        </svg>
-                        <span>Start Video Call</span>
-                      </button>
+                      {/* Video Call button / Waiting State */}
+                      {!outgoingCallWaiting ? (
+                        <button
+                          onClick={requestVideoCall}
+                          className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-semibold text-xs shadow-lg shadow-emerald-500/25 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
+                          </svg>
+                          <span>Request Video Call</span>
+                        </button>
+                      ) : (
+                        <div className="space-y-2">
+                          <div className="w-full py-2.5 px-3 rounded-xl bg-cyan-500/20 border border-cyan-400/30 text-cyan-300 text-xs font-semibold flex items-center justify-center gap-2 animate-pulse">
+                            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+                            <span>Calling stranger...</span>
+                          </div>
+                          <button
+                            onClick={cancelCallRequest}
+                            className="text-[11px] text-slate-400 hover:text-rose-400 transition-colors"
+                          >
+                            Cancel Request
+                          </button>
+                        </div>
+                      )}
                     </div>
 
                     {/* Features Badges */}
                     <div className="space-y-3">
-                      <div className="p-3.5 rounded-xl bg-[#121824] border border-[#1e2738] flex items-center gap-3">
+                      <div className="p-3.5 rounded-xl bg-[#121824] border border-[#1e2838] flex items-center gap-3">
                         <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400">
                           🛡️
                         </div>
                         <div>
-                          <div className="text-xs font-semibold text-white">Anonymous by default</div>
-                          <div className="text-[10px] text-slate-400">No phone number shared</div>
+                          <div className="text-xs font-semibold text-white">Mutual Consent</div>
+                          <div className="text-[10px] text-slate-400">Video requires other person&apos;s permission</div>
                         </div>
                       </div>
 
-                      <div className="p-3.5 rounded-xl bg-[#121824] border border-[#1e2738] flex items-center gap-3">
+                      <div className="p-3.5 rounded-xl bg-[#121824] border border-[#1e2838] flex items-center gap-3">
                         <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
                           🎯
                         </div>
                         <div>
-                          <div className="text-xs font-semibold text-white">Match smarter</div>
-                          <div className="text-[10px] text-slate-400">Filter by interests & language</div>
+                          <div className="text-xs font-semibold text-white">Camera Optional</div>
+                          <div className="text-[10px] text-slate-400">View incoming video even without a webcam</div>
                         </div>
                       </div>
                     </div>
