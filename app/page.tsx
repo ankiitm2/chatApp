@@ -79,12 +79,6 @@ export default function Home() {
       }
     };
 
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current!);
-      });
-    }
-
     return pc;
   }, []);
 
@@ -243,8 +237,12 @@ export default function Home() {
       socketRef.current?.emit("video-state", { enabled: true });
 
       const pc = createPeerConnection();
+      const senders = pc.getSenders();
       stream.getTracks().forEach((track) => {
-        pc.addTrack(track, stream);
+        const alreadyAdded = senders.some((s) => s.track === track);
+        if (!alreadyAdded) {
+          pc.addTrack(track, stream);
+        }
       });
 
       const offer = await pc.createOffer();
@@ -779,8 +777,10 @@ export default function Home() {
                         onClick={startVideo}
                         className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-semibold text-xs shadow-lg shadow-emerald-500/25 transition-all flex items-center justify-center gap-2 cursor-pointer"
                       >
-                        <span className="w-2 h-2 rounded-full bg-white animate-ping"></span>
-                        <span>Go Live Now</span>
+                        <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
+                        </svg>
+                        <span>Start Video Call</span>
                       </button>
                     </div>
 
