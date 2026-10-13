@@ -2,6 +2,15 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
+import {
+  getOrCreateUserProfile,
+  recordMatchHistory,
+  saveFriendship,
+  fetchFriends,
+  fetchMatchHistory,
+  FriendItem,
+  MatchHistoryItem,
+} from "./lib/db";
 
 type Phase = "setup" | "waiting" | "chat" | "ended";
 type Gender = "male" | "female" | "other";
@@ -33,6 +42,12 @@ export default function Home() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [draft, setDraft] = useState("");
   const [onlineCount, setOnlineCount] = useState(3425);
+
+  // Supabase User & Drawer state
+  const [userId, setUserId] = useState<string | null>(null);
+  const [activeModal, setActiveModal] = useState<"none" | "friends" | "history">("none");
+  const [friendsList, setFriendsList] = useState<FriendItem[]>([]);
+  const [historyList, setHistoryList] = useState<MatchHistoryItem[]>([]);
 
   // Friend System states
   const [friendStatus, setFriendStatus] = useState<"none" | "sent" | "received" | "friends">("none");
@@ -180,6 +195,12 @@ export default function Home() {
         setCommon(d.common);
         setMsgs([]);
         setPhase("chat");
+
+        // Record to Supabase match history
+        const savedId = typeof window !== "undefined" ? localStorage.getItem("neonchat_user_id") : null;
+        if (savedId) {
+          recordMatchHistory(savedId, d.nick, d.gender || "male", d.common);
+        }
       }
     );
 
@@ -281,13 +302,20 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [msgs]);
 
-  const find = () => {
+  const find = async () => {
     cleanupMediaAndPeer();
     setPhase("waiting");
+
+    const interestsArr = interests.split(",").map((i) => i.trim()).filter(Boolean);
+
+    // Save or update profile in Supabase
+    const uid = await getOrCreateUserProfile(nick || "Stranger", gender, interestsArr);
+    if (uid) setUserId(uid);
+
     socketRef.current?.emit("find", {
       nick,
       gender,
-      interests: interests.split(",").map((i) => i.trim()).filter(Boolean),
+      interests: interestsArr,
     });
   };
 
@@ -324,11 +352,16 @@ export default function Home() {
     setTimeout(() => setShowToast(null), 3000);
   };
 
-  const acceptFriendRequest = () => {
+  const acceptFriendRequest = async () => {
     socketRef.current?.emit("friend-accept", { nick, gender });
     setFriendStatus("friends");
     setShowToast(`You and ${partner || "Stranger"} are now friends! 🎉`);
     setTimeout(() => setShowToast(null), 4000);
+
+    // Persist to Supabase
+    if (userId && partner) {
+      await saveFriendship(userId, partner, partnerGender);
+    }
   };
 
   // Initiate a video call request to the stranger
@@ -504,6 +537,33 @@ export default function Home() {
                 </button>
               </div>
             )}
+
+            {/* Friends & Match History buttons */}
+            <button
+              onClick={async () => {
+                const list = await fetchFriends(userId);
+                setFriendsList(list);
+                setActiveModal("friends");
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#151c27] hover:bg-[#1d2737] border border-[#232f41] text-xs font-medium text-slate-300 hover:text-white transition-all cursor-pointer"
+              title="View Friends"
+            >
+              <span>👥</span>
+              <span className="hidden sm:inline">Friends</span>
+            </button>
+
+            <button
+              onClick={async () => {
+                const list = await fetchMatchHistory(userId);
+                setHistoryList(list);
+                setActiveModal("history");
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#151c27] hover:bg-[#1d2737] border border-[#232f41] text-xs font-medium text-slate-300 hover:text-white transition-all cursor-pointer"
+              title="Match History"
+            >
+              <span>🕒</span>
+              <span className="hidden sm:inline">History</span>
+            </button>
 
             {/* User Profile Pill */}
             <div className="flex items-center gap-2 px-2.5 py-1 rounded-full bg-[#141c27] border border-[#232f41]">
@@ -1084,6 +1144,120 @@ export default function Home() {
           </div>
         )}
       </div>
+
+      {/* Friends Drawer Modal */}
+      {activeModal === "friends" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-2xl bg-[#141b27] border border-[#233147] p-6 space-y-4 shadow-2xl animate-in zoom-in-95">
+            <div className="flex items-center justify-between border-b border-[#222e40] pb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">👥</span>
+                <h3 className="text-base font-bold text-white">Your Friends</h3>
+              </div>
+              <button
+                onClick={() => setActiveModal("none")}
+                className="w-7 h-7 rounded-lg bg-[#1c2536] hover:bg-[#28354c] text-slate-400 hover:text-white flex items-center justify-center text-xs transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
+              {friendsList.length === 0 ? (
+                <div className="py-8 text-center text-xs text-slate-400 space-y-1">
+                  <p className="text-2xl mb-1">🤝</p>
+                  <p className="font-medium text-slate-300">No friends saved yet</p>
+                  <p className="text-[11px] text-slate-500">Add strangers you match with during chats!</p>
+                </div>
+              ) : (
+                friendsList.map((f) => (
+                  <div
+                    key={f.id}
+                    className="flex items-center justify-between p-3 rounded-xl bg-[#0e141f] border border-[#1f2a3c] hover:border-cyan-500/40 transition-colors"
+                  >
+                    <div className="flex items-center gap-3">
+                      {renderAvatar((f.friend_gender as Gender) || "other", f.friend_name, "w-9 h-9 text-xs")}
+                      <div>
+                        <div className="text-xs font-bold text-white">{f.friend_name}</div>
+                        <div className="text-[10px] text-slate-400 capitalize">{f.friend_gender}</div>
+                      </div>
+                    </div>
+                    <span className="text-[10px] text-emerald-400 bg-emerald-950/60 border border-emerald-500/30 px-2 py-0.5 rounded-full font-medium">
+                      Friend
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <button
+              onClick={() => setActiveModal("none")}
+              className="w-full py-2.5 rounded-xl bg-[#1b2537] hover:bg-[#253249] text-xs font-semibold text-slate-200 transition-colors cursor-pointer"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Match History Modal */}
+      {activeModal === "history" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-2xl bg-[#141b27] border border-[#233147] p-6 space-y-4 shadow-2xl animate-in zoom-in-95">
+            <div className="flex items-center justify-between border-b border-[#222e40] pb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">🕒</span>
+                <h3 className="text-base font-bold text-white">Recent Match History</h3>
+              </div>
+              <button
+                onClick={() => setActiveModal("none")}
+                className="w-7 h-7 rounded-lg bg-[#1c2536] hover:bg-[#28354c] text-slate-400 hover:text-white flex items-center justify-center text-xs transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
+              {historyList.length === 0 ? (
+                <div className="py-8 text-center text-xs text-slate-400 space-y-1">
+                  <p className="text-2xl mb-1">💬</p>
+                  <p className="font-medium text-slate-300">No match history yet</p>
+                  <p className="text-[11px] text-slate-500">Start matching to view past connections!</p>
+                </div>
+              ) : (
+                historyList.map((h) => (
+                  <div
+                    key={h.id}
+                    className="flex items-center justify-between p-3 rounded-xl bg-[#0e141f] border border-[#1f2a3c]"
+                  >
+                    <div className="flex items-center gap-3">
+                      {renderAvatar((h.partner_gender as Gender) || "other", h.partner_name, "w-9 h-9 text-xs")}
+                      <div>
+                        <div className="text-xs font-bold text-white">{h.partner_name}</div>
+                        <div className="text-[10px] text-slate-400">
+                          {h.common_interests && h.common_interests.length > 0
+                            ? `Shared: ${h.common_interests.join(", ")}`
+                            : "Random Match"}
+                        </div>
+                      </div>
+                    </div>
+                    <span className="text-[10px] text-slate-500">
+                      {new Date(h.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <button
+              onClick={() => setActiveModal("none")}
+              className="w-full py-2.5 rounded-xl bg-[#1b2537] hover:bg-[#253249] text-xs font-semibold text-slate-200 transition-colors cursor-pointer"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
