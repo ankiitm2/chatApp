@@ -1,4 +1,6 @@
 import { createServer } from "http";
+import fs from "fs";
+import path from "path";
 import next from "next";
 import { Server } from "socket.io";
 
@@ -7,7 +9,18 @@ const app = next({ dev });
 const handle = app.getRequestHandler();
 await app.prepare();
 
-const httpServer = createServer((req, res) => handle(req, res));
+const httpServer = createServer((req, res) => {
+  if (req.url === "/.well-known/assetlinks.json") {
+    const assetlinksPath = path.join(process.cwd(), "public", ".well-known", "assetlinks.json");
+    if (fs.existsSync(assetlinksPath)) {
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.writeHead(200);
+      return fs.createReadStream(assetlinksPath).pipe(res);
+    }
+  }
+  return handle(req, res);
+});
 const io = new Server(httpServer, {
   maxHttpBufferSize: 1e7, // 10MB for photos and voice notes
 });
