@@ -39,8 +39,22 @@ function match(me) {
   partners.set(me.id, other.id);
   partners.set(other.id, me.id);
   const common = me.interests.filter((i) => other.interests.includes(i));
-  io.to(me.id).emit("matched", { nick: other.nick, gender: other.gender, common, isInitiator: true });
-  io.to(other.id).emit("matched", { nick: me.nick, gender: me.gender, common, isInitiator: false });
+  io.to(me.id).emit("matched", {
+    nick: other.nick,
+    gender: other.gender,
+    interests: other.interests,
+    style: other.style,
+    common,
+    isInitiator: true,
+  });
+  io.to(other.id).emit("matched", {
+    nick: me.nick,
+    gender: me.gender,
+    interests: me.interests,
+    style: me.style,
+    common,
+    isInitiator: false,
+  });
 }
 
 let onlineCount = 0;
@@ -49,7 +63,7 @@ io.on("connection", (socket) => {
   onlineCount++;
   io.emit("online-count", onlineCount);
 
-  socket.on("find", ({ nick, gender, interests }) => {
+  socket.on("find", ({ nick, gender, interests, style }) => {
     unpair(socket.id);
     dequeue(socket.id);
     const clean = (Array.isArray(interests) ? interests : [])
@@ -62,6 +76,7 @@ io.on("connection", (socket) => {
       nick: String(nick || "Stranger").trim().slice(0, 20) || "Stranger",
       gender: validGender,
       interests: clean,
+      style: style || "text",
     });
   });
 
