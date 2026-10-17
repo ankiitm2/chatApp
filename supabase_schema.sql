@@ -104,3 +104,14 @@ CREATE POLICY "Public read direct_messages" ON public.direct_messages FOR SELECT
 DROP POLICY IF EXISTS "Public insert direct_messages" ON public.direct_messages;
 CREATE POLICY "Public insert direct_messages" ON public.direct_messages FOR INSERT WITH CHECK (true);
 
+-- Enable Supabase Realtime for instant messaging updates
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables 
+    WHERE pubname = 'supabase_realtime' AND tablename = 'direct_messages'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.direct_messages;
+  END IF;
+END $$;
+

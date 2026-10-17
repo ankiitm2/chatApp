@@ -165,6 +165,26 @@ io.on("connection", (socket) => {
     if (p && payload) {
       io.to(p).emit("message", payload);
     }
+
+    // Direct real-time routing for friend / past conversation messages
+    if (payload && typeof payload === "object" && payload.toHandle) {
+      const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
+      const target = onlineUsers.get(norm);
+      if (target && target.socketId && target.socketId !== socket.id && target.socketId !== p) {
+        io.to(target.socketId).emit("message", payload);
+      }
+    }
+  });
+
+  socket.on("direct-message", (payload) => {
+    if (payload && payload.toHandle) {
+      const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
+      const target = onlineUsers.get(norm);
+      if (target && target.socketId && target.socketId !== socket.id) {
+        io.to(target.socketId).emit("direct-message", payload);
+        io.to(target.socketId).emit("message", payload);
+      }
+    }
   });
 
   socket.on("register-identity", (info) => {

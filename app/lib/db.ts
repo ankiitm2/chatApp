@@ -143,6 +143,7 @@ export async function saveFriendship(
   friendHandle?: string,
   isMember = false
 ) {
+  const cleanHandle = friendHandle ? friendHandle.replace(/^@/, "").trim() : undefined;
   if (typeof window !== "undefined") {
     try {
       const prev = localStorage.getItem("qs_friends_list");
@@ -151,40 +152,70 @@ export async function saveFriendship(
         id: "fr-" + Date.now(),
         friend_name: friendName,
         friend_gender: friendGender,
-        friend_handle: friendHandle,
+        friend_handle: cleanHandle,
         is_member: isMember,
         created_at: new Date().toISOString(),
       };
-      localStorage.setItem("qs_friends_list", JSON.stringify([newItem, ...list.filter(x => x.friend_name !== friendName)]));
+      const filtered = list.filter((x) => {
+        if (cleanHandle && x.friend_handle) {
+          return x.friend_handle.toLowerCase() !== cleanHandle.toLowerCase();
+        }
+        return x.friend_name.toLowerCase() !== friendName.toLowerCase();
+      });
+      localStorage.setItem("qs_friends_list", JSON.stringify([newItem, ...filtered]));
     } catch {
       // ignore
     }
   }
 
-  if (!supabase || !userId) return;
+  if (!supabase) return;
 
   try {
-    // Look up or insert friend profile
-    let { data: friendProfile } = await supabase
-      .from("profiles")
-      .select("id")
-      .eq("username", friendName)
-      .maybeSingle();
-
-    if (!friendProfile) {
-      const { data: newProfile } = await supabase
+    let friendProfileId: string | null = null;
+    if (cleanHandle) {
+      const { data: byHandle } = await supabase
         .from("profiles")
-        .insert([{ username: friendName, gender: friendGender }])
         .select("id")
-        .single();
-      friendProfile = newProfile;
+        .eq("handle_normalized", cleanHandle.toLowerCase())
+        .maybeSingle();
+      if (byHandle) {
+        friendProfileId = byHandle.id;
+      }
     }
 
-    if (friendProfile) {
+    if (!friendProfileId) {
+      const { data: byName } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("username", friendName)
+        .maybeSingle();
+      if (byName) {
+        friendProfileId = byName.id;
+      } else {
+        const { data: newProfile } = await supabase
+          .from("profiles")
+          .insert([
+            {
+              username: friendName,
+              gender: friendGender,
+              handle: cleanHandle || friendName,
+              handle_normalized: (cleanHandle || friendName).toLowerCase(),
+              is_member: isMember,
+            },
+          ])
+          .select("id")
+          .single();
+        if (newProfile) friendProfileId = newProfile.id;
+      }
+    }
+
+    // Only attempt Supabase friendships upsert if userId is a valid UUID
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (userId && uuidRegex.test(userId) && friendProfileId) {
       await supabase.from("friendships").upsert([
         {
           user_id: userId,
-          friend_id: friendProfile.id,
+          friend_id: friendProfileId,
           status: "accepted",
         },
       ]);
@@ -194,9 +225,29 @@ export async function saveFriendship(
   }
 }
 
-// 4. Fetch Friend list
-export async function fetchFriends(userId: string | null): Promise<FriendItem[]> {
-  if (supabase && userId) {
+// 4. Fetch Friend list (merges local, Supabase friendships, and direct_messages contacts)
+export async function fetchFriends(userId: string | null, userHandle?: string): Promise<FriendItem[]> {
+  const mergedFriendsMap = new Map<string, FriendItem>();
+
+  // 1. Local storage load
+  if (typeof window !== "undefined") {
+    try {
+      const local = localStorage.getItem("qs_friends_list");
+      if (local) {
+        const list: FriendItem[] = JSON.parse(local);
+        list.forEach((f) => {
+          const key = (f.friend_handle || f.friend_name).toLowerCase();
+          mergedFriendsMap.set(key, f);
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // 2. Supabase friendships table
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (supabase && userId && uuidRegex.test(userId)) {
     try {
       const { data, error } = await supabase
         .from("friendships")
@@ -205,7 +256,9 @@ export async function fetchFriends(userId: string | null): Promise<FriendItem[]>
           created_at,
           profiles:friend_id (
             username,
-            gender
+            gender,
+            handle,
+            is_member
           )
         `)
         .eq("user_id", userId)
@@ -214,35 +267,64 @@ export async function fetchFriends(userId: string | null): Promise<FriendItem[]>
       type FriendshipRecord = {
         id: string;
         created_at: string;
-        profiles: { username?: string; gender?: string } | null;
+        profiles: { username?: string; gender?: string; handle?: string; is_member?: boolean } | null;
       };
 
       if (!error && data && data.length > 0) {
-        return (data as unknown as FriendshipRecord[]).map((item) => ({
-          id: item.id,
-          friend_name: item.profiles?.username || "Friend",
-          friend_gender: item.profiles?.gender || "other",
-          created_at: item.created_at,
-        }));
+        (data as unknown as FriendshipRecord[]).forEach((item) => {
+          const name = item.profiles?.username || item.profiles?.handle || "Friend";
+          const handle = item.profiles?.handle || undefined;
+          const key = (handle || name).toLowerCase();
+          mergedFriendsMap.set(key, {
+            id: item.id,
+            friend_name: name,
+            friend_gender: item.profiles?.gender || "other",
+            friend_handle: handle,
+            is_member: !!item.profiles?.is_member,
+            created_at: item.created_at,
+          });
+        });
       }
     } catch (err) {
       console.warn("Supabase fetchFriends error:", err);
     }
   }
 
-  // Local storage fallback
-  if (typeof window !== "undefined") {
+  // 3. Auto-discover contacts from direct_messages if userHandle is provided
+  if (supabase && userHandle) {
     try {
-      const local = localStorage.getItem("qs_friends_list");
-      if (local) {
-        return JSON.parse(local);
+      const clean = userHandle.toLowerCase().trim().replace(/^@/, "");
+      const { data: dms } = await supabase
+        .from("direct_messages")
+        .select("sender_handle, receiver_handle, created_at")
+        .or(`sender_handle.eq.${clean},receiver_handle.eq.${clean}`)
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (dms && dms.length > 0) {
+        dms.forEach((row: { sender_handle: string; receiver_handle: string; created_at: string }) => {
+          const otherHandle = row.sender_handle.toLowerCase() === clean ? row.receiver_handle : row.sender_handle;
+          if (otherHandle && otherHandle !== "stranger") {
+            const key = otherHandle.toLowerCase();
+            if (!mergedFriendsMap.has(key)) {
+              mergedFriendsMap.set(key, {
+                id: `dm-${key}`,
+                friend_name: otherHandle,
+                friend_gender: "other",
+                friend_handle: otherHandle,
+                is_member: true,
+                created_at: row.created_at,
+              });
+            }
+          }
+        });
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      console.warn("Error discovering direct message contacts:", err);
     }
   }
 
-  return [];
+  return Array.from(mergedFriendsMap.values());
 }
 
 // 5. Fetch Match History
