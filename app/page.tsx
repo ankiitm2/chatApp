@@ -28,6 +28,11 @@ import {
   normalizeHandle,
   generateHandleSuggestions,
 } from "./lib/handleRules";
+import {
+  sendAppNotification,
+  requestNotificationPermission,
+  playNotificationChime,
+} from "./lib/notifications";
 
 type Phase = "setup" | "waiting" | "chat" | "ended" | "history";
 type Gender = "male" | "female" | "other";
@@ -245,6 +250,12 @@ export default function Home() {
 
   // Load real member session, friends, and history on mount (and sync Supabase OAuth redirect)
   useEffect(() => {
+    // Register Service Worker for mobile PWA notifications
+    if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+      requestNotificationPermission();
+    }
+
     const stored = getStoredMember();
     if (stored) {
       setCurrentMember(stored);
@@ -567,6 +578,17 @@ export default function Home() {
           },
         ]);
       }
+
+      // Send background / tab-away notification if not actively looking at chat
+      if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
+        const preview = typeof payload === "string" ? payload : (payload?.text || (payload?.type === "image" ? "📷 Sent an image" : "🎙️ Voice message"));
+        sendAppNotification("Quiet Signal", {
+          body: preview,
+          tag: "chat-msg",
+        });
+      } else {
+        playNotificationChime();
+      }
     });
 
     // Remote partner ended video call -> close video viewport immediately for other person!
@@ -579,6 +601,11 @@ export default function Home() {
 
     s.on("call-request", () => {
       setIncomingCallRequest(true);
+      sendAppNotification("Quiet Signal - Video Call", {
+        body: "Your chat partner requested a video call!",
+        tag: "video-request",
+        requireInteraction: true,
+      });
     });
 
     s.on("call-cancel", () => {
@@ -666,6 +693,11 @@ export default function Home() {
       fromIsMember: boolean;
     }) => {
       setIncomingDirectInvite(invite);
+      sendAppNotification("Quiet Signal - Direct Chat", {
+        body: `${invite.fromHandle ? `@${invite.fromHandle}` : invite.fromNick} wants to chat with you!`,
+        tag: "direct-invite",
+        requireInteraction: true,
+      });
     });
 
     s.on("direct-chat-error", (err: { message: string }) => {
@@ -2463,6 +2495,15 @@ export default function Home() {
                       </button>
                     </div>
 
+                    <button
+                      type="button"
+                      onClick={() => setPhase("history")}
+                      className="w-full py-2.5 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/80 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[40px]"
+                    >
+                      <span>👥</span>
+                      <span>Talk to a friend or search @handle instead →</span>
+                    </button>
+
                     {/* Continuing path indicator */}
                     <div className="text-center pt-1">
                       {currentMember ? (
@@ -2575,12 +2616,25 @@ export default function Home() {
               </div>
             )}
 
-            <button
-              onClick={stop}
-              className="w-full py-2.5 px-4 rounded-xl border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 text-xs font-semibold transition-colors cursor-pointer min-h-[44px]"
-            >
-              Cancel search
-            </button>
+            <div className="space-y-2 pt-1">
+              <button
+                onClick={() => {
+                  stop();
+                  setPhase("history");
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 text-[#5b4df2] dark:text-indigo-400 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 min-h-[40px] border border-indigo-100 dark:border-indigo-900/40 cursor-pointer"
+              >
+                <span>👥</span>
+                <span>Chat with a friend or search by @handle</span>
+              </button>
+
+              <button
+                onClick={stop}
+                className="w-full py-2.5 px-4 rounded-xl border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 text-xs font-semibold transition-colors cursor-pointer min-h-[44px]"
+              >
+                Cancel search
+              </button>
+            </div>
           </div>
         </div>
       )}
