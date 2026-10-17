@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.quietsignal.app",
+      "sha256_cert_fingerprints": [
+        "BE:B3:41:03:8A:B3:56:A3:D2:80:9B:45:43:00:11:C2:56:37:62:4C:57:69:4A:DC:7B:81:74:5D:96:59:6D:0D"
+      ]
+    }
+  }
+]
