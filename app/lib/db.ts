@@ -11,6 +11,8 @@ export interface MatchHistoryItem {
   id: string;
   partner_name: string;
   partner_gender: string;
+  partner_handle?: string;
+  is_member?: boolean;
   common_interests: string[];
   had_video: boolean;
   matched_at: string;
@@ -21,6 +23,8 @@ export interface FriendItem {
   id: string;
   friend_name: string;
   friend_gender: string;
+  friend_handle?: string;
+  is_member?: boolean;
   created_at: string;
 }
 
@@ -28,7 +32,9 @@ export interface FriendItem {
 export async function getOrCreateUserProfile(
   username: string,
   gender: "male" | "female" | "other",
-  interests: string[]
+  interests: string[],
+  handle?: string,
+  isMember = false
 ): Promise<string | null> {
   if (!supabase) return null;
 
@@ -39,7 +45,13 @@ export async function getOrCreateUserProfile(
       // Update existing profile
       const { data, error } = await supabase
         .from("profiles")
-        .update({ username, gender, interests, updated_at: new Date().toISOString() })
+        .update({
+          username,
+          gender,
+          interests,
+          ...(handle ? { handle, handle_normalized: handle.toLowerCase(), is_member: isMember } : {}),
+          updated_at: new Date().toISOString(),
+        })
         .eq("id", savedId)
         .select("id")
         .single();
@@ -50,7 +62,14 @@ export async function getOrCreateUserProfile(
     // Insert new profile
     const { data, error } = await supabase
       .from("profiles")
-      .insert([{ username, gender, interests }])
+      .insert([
+        {
+          username,
+          gender,
+          interests,
+          ...(handle ? { handle, handle_normalized: handle.toLowerCase(), is_member: isMember } : {}),
+        },
+      ])
       .select("id")
       .single();
 
@@ -73,16 +92,20 @@ export async function recordMatchHistory(
   partnerName: string,
   partnerGender: string,
   commonInterests: string[],
-  hadVideo = false
+  hadVideo = false,
+  partnerHandle?: string,
+  isMember = false
 ) {
   if (typeof window !== "undefined") {
     try {
       const prev = localStorage.getItem("qs_match_history");
-      const list: MatchHistoryItem[] = prev ? JSON.parse(prev) : [...DEFAULT_SAMPLE_HISTORY];
+      const list: MatchHistoryItem[] = prev ? JSON.parse(prev) : [];
       const newItem: MatchHistoryItem = {
         id: "hist-" + Date.now(),
         partner_name: partnerName,
         partner_gender: partnerGender,
+        partner_handle: partnerHandle,
+        is_member: isMember,
         common_interests: commonInterests,
         had_video: hadVideo,
         matched_at: new Date().toISOString(),
@@ -102,6 +125,7 @@ export async function recordMatchHistory(
         user_id: userId,
         partner_name: partnerName,
         partner_gender: partnerGender,
+        partner_handle: partnerHandle,
         common_interests: commonInterests,
         had_video: hadVideo,
       },
@@ -115,16 +139,20 @@ export async function recordMatchHistory(
 export async function saveFriendship(
   userId: string | null,
   friendName: string,
-  friendGender: string
+  friendGender: string,
+  friendHandle?: string,
+  isMember = false
 ) {
   if (typeof window !== "undefined") {
     try {
       const prev = localStorage.getItem("qs_friends_list");
-      const list: FriendItem[] = prev ? JSON.parse(prev) : [...DEFAULT_SAMPLE_FRIENDS];
+      const list: FriendItem[] = prev ? JSON.parse(prev) : [];
       const newItem: FriendItem = {
         id: "fr-" + Date.now(),
         friend_name: friendName,
         friend_gender: friendGender,
+        friend_handle: friendHandle,
+        is_member: isMember,
         created_at: new Date().toISOString(),
       };
       localStorage.setItem("qs_friends_list", JSON.stringify([newItem, ...list.filter(x => x.friend_name !== friendName)]));
@@ -165,58 +193,6 @@ export async function saveFriendship(
     console.warn("Supabase saveFriendship error:", err);
   }
 }
-
-// Default seeds inspired by the design (River, Atlas, Sunny)
-const DEFAULT_SAMPLE_HISTORY: MatchHistoryItem[] = [
-  {
-    id: "hist-1",
-    partner_name: "River",
-    partner_gender: "female",
-    common_interests: ["Music"],
-    had_video: true,
-    matched_at: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
-    last_message: "That sounds perfect. Send me your first three picks?",
-  },
-  {
-    id: "hist-2",
-    partner_name: "Atlas",
-    partner_gender: "male",
-    common_interests: ["Travel"],
-    had_video: false,
-    matched_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-    last_message: "Thanks for the travel tips! I'll look into Lisbon.",
-  },
-  {
-    id: "hist-3",
-    partner_name: "Sunny",
-    partner_gender: "female",
-    common_interests: ["Books"],
-    had_video: false,
-    matched_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-    last_message: "That book is on my list too. Let me know what you think.",
-  },
-];
-
-const DEFAULT_SAMPLE_FRIENDS: FriendItem[] = [
-  {
-    id: "fr-1",
-    friend_name: "River",
-    friend_gender: "female",
-    created_at: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
-  },
-  {
-    id: "fr-2",
-    friend_name: "Atlas",
-    friend_gender: "male",
-    created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: "fr-3",
-    friend_name: "Sunny",
-    friend_gender: "female",
-    created_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-];
 
 // 4. Fetch Friend list
 export async function fetchFriends(userId: string | null): Promise<FriendItem[]> {
@@ -266,7 +242,7 @@ export async function fetchFriends(userId: string | null): Promise<FriendItem[]>
     }
   }
 
-  return DEFAULT_SAMPLE_FRIENDS;
+  return [];
 }
 
 // 5. Fetch Match History
@@ -300,5 +276,5 @@ export async function fetchMatchHistory(userId: string | null): Promise<MatchHis
     }
   }
 
-  return DEFAULT_SAMPLE_HISTORY;
+  return [];
 }

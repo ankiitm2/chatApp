@@ -8,7 +8,9 @@ const handle = app.getRequestHandler();
 await app.prepare();
 
 const httpServer = createServer((req, res) => handle(req, res));
-const io = new Server(httpServer);
+const io = new Server(httpServer, {
+  maxHttpBufferSize: 1e7, // 10MB for photos and voice notes
+});
 
 const waiting = []; // { id, nick, interests }
 const partners = new Map(); // socketId -> socketId
@@ -23,6 +25,7 @@ const unpair = (id) => {
   if (!p) return;
   partners.delete(id);
   partners.delete(p);
+  io.to(p).emit("call-end");
   io.to(p).emit("partner-left");
 };
 
@@ -44,6 +47,8 @@ function match(me) {
     gender: other.gender,
     interests: other.interests,
     style: other.style,
+    isMember: !!other.isMember,
+    handle: other.handle || null,
     common,
     isInitiator: true,
   });
@@ -52,6 +57,8 @@ function match(me) {
     gender: me.gender,
     interests: me.interests,
     style: me.style,
+    isMember: !!me.isMember,
+    handle: me.handle || null,
     common,
     isInitiator: false,
   });
@@ -63,7 +70,7 @@ io.on("connection", (socket) => {
   onlineCount++;
   io.emit("online-count", onlineCount);
 
-  socket.on("find", ({ nick, gender, interests, style }) => {
+  socket.on("find", ({ nick, gender, interests, style, isMember, handle }) => {
     unpair(socket.id);
     dequeue(socket.id);
     const clean = (Array.isArray(interests) ? interests : [])
@@ -77,6 +84,8 @@ io.on("connection", (socket) => {
       gender: validGender,
       interests: clean,
       style: style || "text",
+      isMember: !!isMember,
+      handle: handle ? String(handle).trim().replace(/^@/, "").slice(0, 20) : null,
     });
   });
 
@@ -129,10 +138,17 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("message", (text) => {
+  socket.on("call-end", () => {
     const p = partners.get(socket.id);
-    if (p && typeof text === "string" && text.trim()) {
-      io.to(p).emit("message", text.slice(0, 500));
+    if (p) {
+      io.to(p).emit("call-end");
+    }
+  });
+
+  socket.on("message", (payload) => {
+    const p = partners.get(socket.id);
+    if (p && payload) {
+      io.to(p).emit("message", payload);
     }
   });
 
