@@ -10,8 +10,12 @@ const handle = app.getRequestHandler();
 await app.prepare();
 
 const httpServer = createServer((req, res) => {
-  if (req.url === "/.well-known/assetlinks.json") {
-    const assetlinksPath = path.join(process.cwd(), "public", ".well-known", "assetlinks.json");
+  const cleanUrl = (req.url || "").split("?")[0];
+  if (cleanUrl === "/.well-known/assetlinks.json" || cleanUrl === "/assetlinks.json") {
+    let assetlinksPath = path.join(process.cwd(), "public", ".well-known", "assetlinks.json");
+    if (!fs.existsSync(assetlinksPath)) {
+      assetlinksPath = path.join(process.cwd(), "public", "assetlinks.json");
+    }
     if (fs.existsSync(assetlinksPath)) {
       res.setHeader("Content-Type", "application/json");
       res.setHeader("Cache-Control", "public, max-age=86400");
@@ -162,8 +166,11 @@ io.on("connection", (socket) => {
 
   socket.on("message", (payload) => {
     const p = partners.get(socket.id);
+    let delivered = false;
+
     if (p && payload) {
       io.to(p).emit("message", payload);
+      delivered = true;
     }
 
     // Direct real-time routing for friend / past conversation messages
@@ -172,7 +179,32 @@ io.on("connection", (socket) => {
       const target = onlineUsers.get(norm);
       if (target && target.socketId && target.socketId !== socket.id && target.socketId !== p) {
         io.to(target.socketId).emit("message", payload);
+        delivered = true;
       }
+    }
+
+    // Inform sender that message was delivered to recipient's active socket
+    if (delivered && payload && typeof payload === "object" && payload.id) {
+      socket.emit("message-delivered", {
+        messageId: payload.id,
+        toHandle: payload.toHandle,
+      });
+    }
+  });
+
+  socket.on("message-seen", (data) => {
+    if (!data) return;
+    const { messageId, toHandle, fromHandle } = data;
+    if (toHandle) {
+      const norm = String(toHandle).toLowerCase().trim().replace(/^@/, "");
+      const target = onlineUsers.get(norm);
+      if (target && target.socketId) {
+        io.to(target.socketId).emit("message-seen", { messageId, fromHandle });
+      }
+    }
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("message-seen", { messageId, fromHandle });
     }
   });
 
@@ -183,6 +215,12 @@ io.on("connection", (socket) => {
       if (target && target.socketId && target.socketId !== socket.id) {
         io.to(target.socketId).emit("direct-message", payload);
         io.to(target.socketId).emit("message", payload);
+        if (payload.id) {
+          socket.emit("message-delivered", {
+            messageId: payload.id,
+            toHandle: payload.toHandle,
+          });
+        }
       }
     }
   });

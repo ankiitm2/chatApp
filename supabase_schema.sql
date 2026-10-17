@@ -104,6 +104,14 @@ CREATE POLICY "Public read direct_messages" ON public.direct_messages FOR SELECT
 DROP POLICY IF EXISTS "Public insert direct_messages" ON public.direct_messages;
 CREATE POLICY "Public insert direct_messages" ON public.direct_messages FOR INSERT WITH CHECK (true);
 
+DROP POLICY IF EXISTS "Public update direct_messages" ON public.direct_messages;
+CREATE POLICY "Public update direct_messages" ON public.direct_messages FOR UPDATE USING (true);
+
+-- Add status column (sent, delivered, read) and support sticker type
+ALTER TABLE public.direct_messages ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'sent';
+ALTER TABLE public.direct_messages DROP CONSTRAINT IF EXISTS direct_messages_message_type_check;
+ALTER TABLE public.direct_messages ADD CONSTRAINT direct_messages_message_type_check CHECK (message_type IN ('text', 'image', 'audio', 'sticker'));
+
 -- Enable Supabase Realtime for instant messaging updates
 DO $$
 BEGIN
@@ -114,4 +122,5 @@ BEGIN
     ALTER PUBLICATION supabase_realtime ADD TABLE public.direct_messages;
   END IF;
 END $$;
+
 

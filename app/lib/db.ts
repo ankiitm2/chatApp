@@ -17,6 +17,8 @@ export interface MatchHistoryItem {
   had_video: boolean;
   matched_at: string;
   last_message?: string;
+  last_message_at?: string;
+  unread_count?: number;
 }
 
 export interface FriendItem {
@@ -327,38 +329,122 @@ export async function fetchFriends(userId: string | null, userHandle?: string): 
   return Array.from(mergedFriendsMap.values());
 }
 
-// 5. Fetch Match History
-export async function fetchMatchHistory(userId: string | null): Promise<MatchHistoryItem[]> {
-  if (supabase && userId) {
+// 5. Fetch Match History (dynamically ordered by latest message & includes unread counts)
+export async function fetchMatchHistory(userId: string | null, userHandle?: string): Promise<MatchHistoryItem[]> {
+  const historyMap = new Map<string, MatchHistoryItem>();
+
+  // 1. Load from local storage
+  if (typeof window !== "undefined") {
     try {
-      const { data, error } = await supabase
+      const local = localStorage.getItem("qs_match_history");
+      if (local) {
+        const list: MatchHistoryItem[] = JSON.parse(local);
+        list.forEach((item) => {
+          const key = (item.partner_handle || item.partner_name).toLowerCase();
+          historyMap.set(key, item);
+        });
+      }
+    } catch {}
+  }
+
+  // 2. Load from Supabase match_history
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (supabase && userId && uuidRegex.test(userId)) {
+    try {
+      const { data } = await supabase
         .from("match_history")
-        .select("id, partner_name, partner_gender, common_interests, had_video, matched_at")
+        .select("id, partner_name, partner_gender, partner_handle, common_interests, had_video, matched_at")
         .eq("user_id", userId)
         .order("matched_at", { ascending: false })
-        .limit(20);
+        .limit(30);
 
-      if (!error && data && data.length > 0) {
-        return data as MatchHistoryItem[];
+      if (data && data.length > 0) {
+        data.forEach((item: any) => {
+          const key = (item.partner_handle || item.partner_name).toLowerCase();
+          if (!historyMap.has(key)) {
+            historyMap.set(key, item as MatchHistoryItem);
+          }
+        });
       }
     } catch (err) {
       console.warn("Supabase fetchMatchHistory error:", err);
     }
   }
 
-  // Local storage fallback
-  if (typeof window !== "undefined") {
+  // 3. Augment with latest message and unread count from direct_messages
+  if (supabase && userHandle) {
     try {
-      const local = localStorage.getItem("qs_match_history");
-      if (local) {
-        return JSON.parse(local);
+      const clean = userHandle.toLowerCase().trim().replace(/^@/, "");
+      const { data: dms } = await supabase
+        .from("direct_messages")
+        .select("id, sender_handle, receiver_handle, text, media_url, message_type, created_at, status")
+        .or(`sender_handle.eq.${clean},receiver_handle.eq.${clean}`)
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      if (dms && dms.length > 0) {
+        const unreadByPartner = new Map<string, number>();
+        const latestMsgByPartner = new Map<string, { snippet: string; at: string }>();
+
+        dms.forEach((m: any) => {
+          const isSender = m.sender_handle.toLowerCase() === clean;
+          const partner = isSender ? m.receiver_handle : m.sender_handle;
+          const pKey = partner.toLowerCase();
+
+          // Unread tally for messages sent to me that are not yet read
+          if (!isSender && m.status !== "read") {
+            unreadByPartner.set(pKey, (unreadByPartner.get(pKey) || 0) + 1);
+          }
+
+          if (!latestMsgByPartner.has(pKey)) {
+            let snippet = m.text || "";
+            if (m.message_type === "image") snippet = "📷 Photo";
+            else if (m.message_type === "audio") snippet = "🎙️ Voice message";
+            else if (m.message_type === "sticker") snippet = "✨ Sticker";
+
+            latestMsgByPartner.set(pKey, {
+              snippet,
+              at: m.created_at,
+            });
+          }
+        });
+
+        // Merge latest message snippet, timestamp, and unread counts
+        latestMsgByPartner.forEach((info, pKey) => {
+          const unread = unreadByPartner.get(pKey) || 0;
+          if (historyMap.has(pKey)) {
+            const existing = historyMap.get(pKey)!;
+            existing.last_message = info.snippet;
+            existing.last_message_at = info.at;
+            existing.unread_count = unread;
+          } else {
+            historyMap.set(pKey, {
+              id: `conv-${pKey}`,
+              partner_name: pKey,
+              partner_gender: "other",
+              partner_handle: pKey,
+              is_member: true,
+              common_interests: ["Direct Chat"],
+              had_video: false,
+              matched_at: info.at,
+              last_message: info.snippet,
+              last_message_at: info.at,
+              unread_count: unread,
+            });
+          }
+        });
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      console.warn("Error augmenting match history with messages:", err);
     }
   }
 
-  return [];
+  // Sort strictly by latest message date or matched date descending
+  return Array.from(historyMap.values()).sort((a, b) => {
+    const timeA = new Date(a.last_message_at || a.matched_at).getTime();
+    const timeB = new Date(b.last_message_at || b.matched_at).getTime();
+    return timeB - timeA;
+  });
 }
 
 export interface DirectMessageRecord {
@@ -366,7 +452,8 @@ export interface DirectMessageRecord {
   conversation_key: string;
   sender_handle: string;
   receiver_handle: string;
-  message_type: "text" | "image" | "audio";
+  message_type: "text" | "image" | "audio" | "sticker";
+  status?: "sent" | "delivered" | "read";
   text?: string;
   media_url?: string;
   created_at: string;
@@ -385,19 +472,22 @@ export function getConversationKey(h1: string, h2: string): string {
  * Saves a direct chat message to Supabase and local cache.
  */
 export async function saveDirectMessage(params: {
+  id?: string;
   senderHandle: string;
   receiverHandle: string;
   senderId?: string | null;
   receiverId?: string | null;
-  messageType?: "text" | "image" | "audio";
+  messageType?: "text" | "image" | "audio" | "sticker";
+  status?: "sent" | "delivered" | "read";
   text?: string;
   mediaUrl?: string;
 }) {
-  const { senderHandle, receiverHandle, senderId, receiverId, messageType = "text", text, mediaUrl } = params;
+  const { id, senderHandle, receiverHandle, senderId, receiverId, messageType = "text", status = "sent", text, mediaUrl } = params;
   if (!senderHandle || !receiverHandle) return;
 
   const conversationKey = getConversationKey(senderHandle, receiverHandle);
   const now = new Date().toISOString();
+  const messageId = id || "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
 
   // 1. Cache locally
   if (typeof window !== "undefined") {
@@ -406,11 +496,12 @@ export async function saveDirectMessage(params: {
       const prev = localStorage.getItem(storageKey);
       const list: DirectMessageRecord[] = prev ? JSON.parse(prev) : [];
       list.push({
-        id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+        id: messageId,
         conversation_key: conversationKey,
         sender_handle: senderHandle.replace(/^@/, ""),
         receiver_handle: receiverHandle.replace(/^@/, ""),
         message_type: messageType,
+        status,
         text,
         media_url: mediaUrl,
         created_at: now,
@@ -426,12 +517,14 @@ export async function saveDirectMessage(params: {
     try {
       await supabase.from("direct_messages").insert([
         {
+          id: messageId.startsWith("msg-") ? undefined : messageId,
           conversation_key: conversationKey,
           sender_handle: senderHandle.replace(/^@/, ""),
           receiver_handle: receiverHandle.replace(/^@/, ""),
           sender_id: senderId || null,
           receiver_id: receiverId || null,
           message_type: messageType,
+          status,
           text: text || null,
           media_url: mediaUrl || null,
         },
@@ -443,11 +536,92 @@ export async function saveDirectMessage(params: {
 }
 
 /**
+ * Marks messages as read in Supabase and local cache.
+ */
+export async function markDirectMessagesAsRead(myHandle: string, partnerHandle: string) {
+  if (!myHandle || !partnerHandle) return;
+  const cleanMy = myHandle.trim().toLowerCase().replace(/^@/, "");
+  const cleanPartner = partnerHandle.trim().toLowerCase().replace(/^@/, "");
+  const conversationKey = getConversationKey(cleanMy, cleanPartner);
+
+  if (typeof window !== "undefined") {
+    try {
+      const storageKey = `qs_chat_${conversationKey}`;
+      const local = localStorage.getItem(storageKey);
+      if (local) {
+        const list: DirectMessageRecord[] = JSON.parse(local);
+        let changed = false;
+        list.forEach((m) => {
+          if (m.receiver_handle.toLowerCase() === cleanMy && m.status !== "read") {
+            m.status = "read";
+            changed = true;
+          }
+        });
+        if (changed) localStorage.setItem(storageKey, JSON.stringify(list));
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      await supabase
+        .from("direct_messages")
+        .update({ status: "read" })
+        .eq("conversation_key", conversationKey)
+        .eq("receiver_handle", cleanMy)
+        .neq("status", "read");
+    } catch (err) {
+      console.warn("Error marking messages as read in Supabase:", err);
+    }
+  }
+}
+
+/**
+ * Updates status of a specific message in local storage and Supabase.
+ */
+export async function updateDirectMessageStatus(
+  myHandle: string,
+  partnerHandle: string,
+  messageId: string,
+  status: "delivered" | "read"
+) {
+  const conversationKey = getConversationKey(myHandle, partnerHandle);
+
+  if (typeof window !== "undefined") {
+    try {
+      const storageKey = `qs_chat_${conversationKey}`;
+      const local = localStorage.getItem(storageKey);
+      if (local) {
+        const list: DirectMessageRecord[] = JSON.parse(local);
+        const target = list.find((m) => m.id === messageId);
+        if (target) {
+          target.status = status;
+          localStorage.setItem(storageKey, JSON.stringify(list));
+        }
+      }
+    } catch {}
+  }
+
+  if (supabase && !messageId.startsWith("msg-")) {
+    try {
+      await supabase
+        .from("direct_messages")
+        .update({ status })
+        .eq("id", messageId);
+    } catch (err) {
+      console.warn("Error updating direct message status in Supabase:", err);
+    }
+  }
+}
+
+/**
  * Fetches the complete message history between two handles.
  */
 export async function fetchDirectChatHistory(myHandle: string, partnerHandle: string): Promise<{
+  id: string;
   mine: boolean;
-  type?: "text" | "image" | "audio";
+  type?: "text" | "image" | "audio" | "sticker";
+  status?: "sent" | "delivered" | "read";
   text: string;
   mediaUrl?: string;
   time: string;
@@ -470,8 +644,10 @@ export async function fetchDirectChatHistory(myHandle: string, partnerHandle: st
           const dTime = new Date(d.created_at);
           const timeStr = `${dTime.getHours().toString().padStart(2, "0")}:${dTime.getMinutes().toString().padStart(2, "0")}`;
           return {
+            id: d.id,
             mine: d.sender_handle.toLowerCase() === cleanMyHandle,
             type: d.message_type || "text",
+            status: d.status || "read",
             text: d.text || "",
             mediaUrl: d.media_url,
             time: timeStr,
@@ -494,8 +670,10 @@ export async function fetchDirectChatHistory(myHandle: string, partnerHandle: st
           const dTime = new Date(d.created_at);
           const timeStr = `${dTime.getHours().toString().padStart(2, "0")}:${dTime.getMinutes().toString().padStart(2, "0")}`;
           return {
+            id: d.id,
             mine: d.sender_handle.toLowerCase() === cleanMyHandle,
             type: d.message_type || "text",
+            status: d.status || "delivered",
             text: d.text || "",
             mediaUrl: d.media_url,
             time: timeStr,

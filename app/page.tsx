@@ -10,6 +10,8 @@ import {
   fetchMatchHistory,
   saveDirectMessage,
   fetchDirectChatHistory,
+  markDirectMessagesAsRead,
+  updateDirectMessageStatus,
   getConversationKey,
   DirectMessageRecord,
   FriendItem,
@@ -42,12 +44,33 @@ type Phase = "setup" | "waiting" | "chat" | "ended" | "history";
 type Gender = "male" | "female" | "other";
 type ConversationStyle = "text" | "video";
 type Msg = {
+  id?: string;
   mine: boolean;
-  type?: "text" | "image" | "audio";
+  type?: "text" | "image" | "audio" | "sticker";
+  status?: "sent" | "delivered" | "read";
   text?: string;
   mediaUrl?: string;
   time: string;
 };
+
+const STICKERS = [
+  { id: "st-heart", emoji: "💜", label: "Signal Heart" },
+  { id: "st-zap", emoji: "⚡", label: "Energy" },
+  { id: "st-sparkle", emoji: "✦", label: "Sparkle" },
+  { id: "st-magic", emoji: "🔮", label: "Magic Orb" },
+  { id: "st-love", emoji: "🥰", label: "Love" },
+  { id: "st-cool", emoji: "😎", label: "Cool Vibe" },
+  { id: "st-party", emoji: "🥳", label: "Celebrate" },
+  { id: "st-coffee", emoji: "☕", label: "Cozy Coffee" },
+  { id: "st-cat", emoji: "🐱", label: "Cat Wave" },
+  { id: "st-fire", emoji: "🔥", label: "Lit" },
+  { id: "st-moon", emoji: "🌙", label: "Night Owl" },
+  { id: "st-ghost", emoji: "👾", label: "Pixel Ghost" },
+  { id: "st-pizza", emoji: "🍕", label: "Pizza" },
+  { id: "st-music", emoji: "🎧", label: "Lo-Fi Beats" },
+  { id: "st-zen", emoji: "🌿", label: "Calm Zen" },
+  { id: "st-rocket", emoji: "🚀", label: "To The Moon" },
+];
 
 const ANONYMOUS_NAMES = [
   "Clover",
@@ -145,6 +168,7 @@ export default function Home() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [draft, setDraft] = useState("");
   const [onlineCount, setOnlineCount] = useState(3842);
+  const [showStickerPicker, setShowStickerPicker] = useState(false);
 
   // Image & Voice recording states
   const [isRecordingAudio, setIsRecordingAudio] = useState(false);
@@ -195,6 +219,28 @@ export default function Home() {
   const [userId, setUserId] = useState<string | null>(null);
   const [friendsList, setFriendsList] = useState<FriendItem[]>([]);
   const [historyList, setHistoryList] = useState<MatchHistoryItem[]>([]);
+
+  // Total unread notifications across all conversations
+  const totalUnread = historyList.reduce((acc, h) => acc + (h.unread_count || 0), 0);
+
+  // Synchronize App Badge and Document Title
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      if (totalUnread > 0) {
+        document.title = `(${totalUnread}) Quiet Signal - Encrypted Chat`;
+      } else {
+        document.title = "Quiet Signal - Encrypted Stranger Chat";
+      }
+    }
+    if (typeof navigator !== "undefined" && "setAppBadge" in navigator) {
+      if (totalUnread > 0) {
+        (navigator as any).setAppBadge(totalUnread).catch(() => {});
+      } else {
+        (navigator as any).clearAppBadge().catch(() => {});
+      }
+    }
+  }, [totalUnread]);
+
   const [historyTab, setHistoryTab] = useState<"chats" | "friends">("chats");
   const [showReviewRequestsModal, setShowReviewRequestsModal] = useState(false);
   const [showSafetyModal, setShowSafetyModal] = useState(false);
@@ -278,7 +324,7 @@ export default function Home() {
       }
       setUserId(stored.id);
       fetchFriends(stored.id, stored.handle).then(setFriendsList);
-      fetchMatchHistory(stored.id).then(setHistoryList);
+      fetchMatchHistory(stored.id, stored.handle).then(setHistoryList);
     } else {
       fetchFriends(null).then(setFriendsList);
       fetchMatchHistory(null).then(setHistoryList);
@@ -299,7 +345,7 @@ export default function Home() {
           setNick(member.handle);
           setUserId(member.id);
           fetchFriends(member.id, member.handle).then(setFriendsList);
-          fetchMatchHistory(member.id).then(setHistoryList);
+          fetchMatchHistory(member.id, member.handle).then(setHistoryList);
           setShowToast(`Welcome back, @${member.handle}!`);
           setTimeout(() => setShowToast(null), 3000);
 
@@ -568,6 +614,11 @@ export default function Home() {
               setMsgs(history);
             }
           });
+          markDirectMessagesAsRead(targetHandle, activeMyHandle);
+          s.emit("message-seen", {
+            toHandle: targetHandle,
+            fromHandle: activeMyHandle,
+          });
         }
 
         // Broad stable region locked per match
@@ -577,11 +628,11 @@ export default function Home() {
         // Record to real history
         const savedId = typeof window !== "undefined" ? localStorage.getItem("neonchat_user_id") : null;
         recordMatchHistory(savedId, d.nick || "River", d.gender || "female", d.common || [], false, d.handle || undefined, !!d.isMember);
-        fetchMatchHistory(savedId).then(setHistoryList);
+        fetchMatchHistory(savedId, activeMyHandle).then(setHistoryList);
       }
     );
 
-    // Support receiving both plain text, images, audio payloads, and direct friend messages
+    // Support receiving both plain text, images, audio, stickers, and direct friend messages
     const handleIncomingMessage = (payload: any) => {
       const now = new Date();
       const timeStr = `${now.getHours().toString().padStart(2, "0")}:${now
@@ -593,6 +644,7 @@ export default function Home() {
       const msgType = typeof payload === "object" ? (payload.type || "text") : "text";
       const mediaUrl = typeof payload === "object" ? payload.mediaUrl : undefined;
       const fromHandle = typeof payload === "object" ? payload.fromHandle : undefined;
+      const msgId = typeof payload === "object" ? payload.id : undefined;
 
       const activeMyHandle = currentMemberRef.current?.handle;
       const currentActivePartnerHandle = partnerHandleRef.current;
@@ -607,31 +659,48 @@ export default function Home() {
         setMsgs((m) => [
           ...m,
           {
+            id: msgId,
             mine: false,
             type: msgType,
             text,
             mediaUrl,
+            status: "read",
             time: payload?.time || timeStr,
           },
         ]);
+
+        // Acknowledge read receipt back to sender in real-time
+        if (fromHandle || currentActivePartnerHandle) {
+          s.emit("message-seen", {
+            messageId: msgId,
+            toHandle: fromHandle || currentActivePartnerHandle,
+            fromHandle: activeMyHandle,
+          });
+        }
       }
 
       // Persist to direct_messages if sender or receiver is known
       const targetPartner = fromHandle || currentActivePartnerHandle || currentActivePartnerName;
       if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
         saveDirectMessage({
+          id: msgId,
           senderHandle: targetPartner,
           receiverHandle: activeMyHandle,
           messageType: msgType,
           text,
           mediaUrl,
+          status: !isDirectForOther ? "read" : "delivered",
         });
-        // Auto-refresh friends list to include new sender
-        fetchFriends(currentMemberRef.current?.id || null, activeMyHandle).then(setFriendsList);
+        // Auto-refresh match history and friends list to update sorting and badge counts instantly
+        const savedId = currentMemberRef.current?.id || null;
+        fetchMatchHistory(savedId, activeMyHandle).then(setHistoryList);
+        fetchFriends(savedId, activeMyHandle).then(setFriendsList);
       }
 
       // Notification / Toast
-      const preview = text || (msgType === "image" ? "📷 Sent an image" : "🎙️ Voice message");
+      const preview = msgType === "sticker" 
+        ? `✨ Sent sticker ${text}` 
+        : text || (msgType === "image" ? "📷 Sent an image" : "🎙️ Voice message");
       if (isDirectForOther) {
         setShowToast(`New message from @${fromHandle}: ${preview.slice(0, 40)}`);
         playNotificationChime();
@@ -648,6 +717,38 @@ export default function Home() {
 
     s.on("message", handleIncomingMessage);
     s.on("direct-message", handleIncomingMessage);
+
+    // Message delivery ack (single tick -> double tick)
+    s.on("message-delivered", ({ messageId }: { messageId?: string }) => {
+      if (!messageId) return;
+      setMsgs((prev) =>
+        prev.map((m) =>
+          m.id === messageId && m.status === "sent" ? { ...m, status: "delivered" } : m
+        )
+      );
+      if (currentMemberRef.current?.handle && partnerHandleRef.current) {
+        updateDirectMessageStatus(currentMemberRef.current.handle, partnerHandleRef.current, messageId, "delivered");
+      }
+    });
+
+    // Message read ack (double gray tick -> double purple tick)
+    s.on("message-seen", ({ messageId, fromHandle }: { messageId?: string; fromHandle?: string }) => {
+      setMsgs((prev) =>
+        prev.map((m) =>
+          m.mine && (m.id === messageId || !messageId || m.status !== "read")
+            ? { ...m, status: "read" }
+            : m
+        )
+      );
+      if (currentMemberRef.current?.handle && (fromHandle || partnerHandleRef.current)) {
+        const partner = fromHandle || partnerHandleRef.current!;
+        if (messageId) {
+          updateDirectMessageStatus(currentMemberRef.current.handle, partner, messageId, "read");
+        } else {
+          markDirectMessagesAsRead(partner, currentMemberRef.current.handle);
+        }
+      }
+    });
 
     // Remote partner ended video call -> close video viewport immediately for other person!
     s.on("call-end", () => {
@@ -1060,12 +1161,21 @@ export default function Home() {
       .getMinutes()
       .toString()
       .padStart(2, "0")}`;
+    const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
 
     const activeMyHandle = currentMember?.handle;
     const targetPartner = partnerHandle || partner;
 
-    const payload: Msg = { mine: true, type: "text", text, time: timeStr };
+    const payload: Msg = {
+      id: msgId,
+      mine: true,
+      type: "text",
+      text,
+      status: "sent",
+      time: timeStr,
+    };
     socketRef.current?.emit("message", {
+      id: msgId,
       type: "text",
       text,
       time: timeStr,
@@ -1079,12 +1189,66 @@ export default function Home() {
     // Persist chat message for logged-in members
     if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
       saveDirectMessage({
+        id: msgId,
         senderHandle: activeMyHandle,
         receiverHandle: targetPartner,
         senderId: userId,
         messageType: "text",
         text,
+        status: "sent",
       });
+      fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
+    }
+  };
+
+  // Send Sticker message
+  const sendSticker = (emoji: string, label: string) => {
+    const now = new Date();
+    const timeStr = `${now.getHours().toString().padStart(2, "0")}:${now
+      .getMinutes()
+      .toString()
+      .padStart(2, "0")}`;
+    const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
+
+    const activeMyHandle = currentMember?.handle;
+    const targetPartner = partnerHandle || partner;
+
+    const payload: Msg = {
+      id: msgId,
+      mine: true,
+      type: "sticker",
+      text: emoji,
+      mediaUrl: label,
+      status: "sent",
+      time: timeStr,
+    };
+
+    socketRef.current?.emit("message", {
+      id: msgId,
+      type: "sticker",
+      text: emoji,
+      mediaUrl: label,
+      time: timeStr,
+      fromHandle: activeMyHandle || nick,
+      fromNick: nick,
+      toHandle: targetPartner && targetPartner !== "Stranger" ? targetPartner : undefined,
+    });
+
+    setMsgs((m) => [...m, payload]);
+    setShowStickerPicker(false);
+
+    if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+      saveDirectMessage({
+        id: msgId,
+        senderHandle: activeMyHandle,
+        receiverHandle: targetPartner,
+        senderId: userId,
+        messageType: "sticker",
+        text: emoji,
+        mediaUrl: label,
+        status: "sent",
+      });
+      fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
     }
   };
 
@@ -1127,15 +1291,18 @@ export default function Home() {
           .getMinutes()
           .toString()
           .padStart(2, "0")}`;
+        const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
 
         const activeMyHandle = currentMember?.handle;
         const targetPartner = partnerHandle || partner;
 
         const payload = {
+          id: msgId,
           type: "image" as const,
           mediaUrl: compressedBase64,
           time: timeStr,
           text: "Photo",
+          status: "sent" as const,
           fromHandle: activeMyHandle || nick,
           fromNick: nick,
           toHandle: targetPartner && targetPartner !== "Stranger" ? targetPartner : undefined,
@@ -1149,13 +1316,16 @@ export default function Home() {
         // Persist photo message for logged-in members
         if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
           saveDirectMessage({
+            id: msgId,
             senderHandle: activeMyHandle,
             receiverHandle: targetPartner,
             senderId: userId,
             messageType: "image",
             text: "Photo",
             mediaUrl: compressedBase64,
+            status: "sent",
           });
+          fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
         }
       };
       img.src = event.target?.result as string;
@@ -1208,15 +1378,18 @@ export default function Home() {
           .getMinutes()
           .toString()
           .padStart(2, "0")}`;
+        const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
 
         const activeMyHandle = currentMember?.handle;
         const targetPartner = partnerHandle || partner;
 
         const payload = {
+          id: msgId,
           type: "audio" as const,
           mediaUrl: base64Audio,
           time: timeStr,
           text: `Voice note (${recordingSeconds}s)`,
+          status: "sent" as const,
           fromHandle: activeMyHandle || nick,
           fromNick: nick,
           toHandle: targetPartner && targetPartner !== "Stranger" ? targetPartner : undefined,
@@ -1230,13 +1403,16 @@ export default function Home() {
         // Persist voice note for logged-in members
         if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
           saveDirectMessage({
+            id: msgId,
             senderHandle: activeMyHandle,
             receiverHandle: targetPartner,
             senderId: userId,
             messageType: "audio",
             text: `Voice note (${recordingSeconds}s)`,
             mediaUrl: base64Audio,
+            status: "sent",
           });
+          fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
         }
       };
       reader.readAsDataURL(blob);
@@ -2264,16 +2440,20 @@ export default function Home() {
               <button
                 type="button"
                 onClick={() => setPhase("history")}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold transition-colors cursor-pointer min-h-[36px]"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold transition-colors cursor-pointer min-h-[36px] relative"
                 title="View Friends and Chat History"
               >
                 <span>👥</span>
                 <span className="hidden sm:inline">Friends & Chats</span>
-                {friendsList.length > 0 && (
-                  <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold">
+                {totalUnread > 0 ? (
+                  <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold animate-pulse">
+                    {totalUnread}
+                  </span>
+                ) : friendsList.length > 0 ? (
+                  <span className="px-1.5 py-0.2 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-[10px] font-bold">
                     {friendsList.length}
                   </span>
-                )}
+                ) : null}
               </button>
 
               <button
@@ -2957,31 +3137,45 @@ export default function Home() {
                                 } else {
                                   setMsgs([]);
                                 }
+                                markDirectMessagesAsRead(targetHandle, currentMember.handle);
+                                socketRef.current?.emit("message-seen", {
+                                  toHandle: targetHandle,
+                                  fromHandle: currentMember.handle,
+                                });
+                                fetchMatchHistory(currentMember.id, currentMember.handle).then(setHistoryList);
                               }
                             }}
                             className="py-4 flex items-center justify-between hover:bg-slate-50/80 dark:hover:bg-slate-800/50 -mx-3 px-3 rounded-2xl transition-all cursor-pointer"
                           >
-                            <div className="flex items-center gap-3.5">
+                            <div className="flex items-center gap-3.5 min-w-0">
                               {renderAvatar(item.partner_name, "w-11 h-11")}
-                              <div className="space-y-1">
+                              <div className="space-y-1 min-w-0">
                                 <div className="flex items-center gap-2">
-                                  <span className="text-xs font-bold text-slate-900 dark:text-white">{item.partner_name}</span>
+                                  <span className="text-xs font-bold text-slate-900 dark:text-white truncate">{item.partner_name}</span>
+                                  {item.partner_handle && (
+                                    <span className="text-[11px] text-slate-400 font-medium truncate">@{item.partner_handle}</span>
+                                  )}
                                   {item.common_interests && item.common_interests.length > 0 && (
-                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-50 dark:bg-indigo-950 text-[#5b4df2] dark:text-indigo-400 font-semibold">
+                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-50 dark:bg-indigo-950 text-[#5b4df2] dark:text-indigo-400 font-semibold shrink-0">
                                       {item.common_interests[0]}
                                     </span>
                                   )}
                                 </div>
-                                <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 max-w-md">
+                                <p className={`text-xs truncate max-w-md ${item.unread_count && item.unread_count > 0 ? "font-bold text-slate-900 dark:text-white" : "text-slate-500 dark:text-slate-400"}`}>
                                   {item.last_message || "Past conversation"}
                                 </p>
                               </div>
                             </div>
 
-                            <div className="text-right shrink-0">
+                            <div className="text-right shrink-0 flex flex-col items-end gap-1.5 ml-3">
                               <span className="text-[11px] text-slate-400">
-                                {new Date(item.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                {new Date(item.last_message_at || item.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                               </span>
+                              {item.unread_count && item.unread_count > 0 ? (
+                                <span className="px-2 py-0.5 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold shadow-xs animate-pulse">
+                                  {item.unread_count}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
                         ))}
@@ -3055,6 +3249,12 @@ export default function Home() {
                                       } else {
                                         setMsgs([]);
                                       }
+                                      markDirectMessagesAsRead(targetHandle, currentMember.handle);
+                                      socketRef.current?.emit("message-seen", {
+                                        toHandle: targetHandle,
+                                        fromHandle: currentMember.handle,
+                                      });
+                                      fetchMatchHistory(currentMember.id, currentMember.handle).then(setHistoryList);
                                     }
                                   }}
                                   className="px-3.5 py-1.5 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] text-white text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shadow-2xs"
@@ -3363,10 +3563,13 @@ export default function Home() {
             <div className="flex items-center gap-3">
               <button
                 onClick={() => setMobileDrawerOpen(true)}
-                className="md:hidden w-8 h-8 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center text-xs"
+                className="md:hidden relative w-8 h-8 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center text-xs"
                 title="Open recent chats"
               >
                 ☰
+                {totalUnread > 0 && (
+                  <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-[#5b4df2] border-2 border-white dark:border-slate-900 animate-pulse"></span>
+                )}
               </button>
               <button
                 onClick={() => setPhase("history")}
@@ -3396,9 +3599,14 @@ export default function Home() {
 
               <button
                 onClick={() => setPhase("history")}
-                className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors relative"
               >
                 <span>History</span>
+                {totalUnread > 0 && (
+                  <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold animate-pulse">
+                    {totalUnread}
+                  </span>
+                )}
               </button>
 
               <button
@@ -3474,6 +3682,12 @@ export default function Home() {
                               } else {
                                 setMsgs([]);
                               }
+                              markDirectMessagesAsRead(targetHandle, currentMember.handle);
+                              socketRef.current?.emit("message-seen", {
+                                toHandle: targetHandle,
+                                fromHandle: currentMember.handle,
+                              });
+                              fetchMatchHistory(currentMember.id, currentMember.handle).then(setHistoryList);
                             }
                           }}
                           className="p-3 rounded-2xl hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors flex items-center gap-3 cursor-pointer"
@@ -3482,11 +3696,18 @@ export default function Home() {
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center justify-between">
                               <span className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate">{h.partner_name}</span>
-                              <span className="text-[10px] text-slate-400">
-                                {new Date(h.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                              </span>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="text-[10px] text-slate-400">
+                                  {new Date(h.last_message_at || h.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                </span>
+                                {h.unread_count && h.unread_count > 0 ? (
+                                  <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[9px] font-bold">
+                                    {h.unread_count}
+                                  </span>
+                                ) : null}
+                              </div>
                             </div>
-                            <p className="text-[11px] text-slate-400 truncate mt-0.5">
+                            <p className={`text-[11px] truncate mt-0.5 ${h.unread_count && h.unread_count > 0 ? "font-bold text-slate-900 dark:text-white" : "text-slate-400"}`}>
                               {h.last_message || (h.common_interests ? h.common_interests[0] : "Past chat")}
                             </p>
                           </div>
@@ -3730,9 +3951,34 @@ export default function Home() {
                         </div>
                       )}
 
+                      {/* 4. Sticker Message */}
+                      {m.type === "sticker" && (
+                        <div
+                          className={`p-1 select-none flex flex-col transition-transform hover:scale-105 active:scale-95 ${
+                            m.mine ? "items-end" : "items-start"
+                          }`}
+                        >
+                          <div className="text-5xl sm:text-6xl filter drop-shadow-sm animate-in zoom-in-75 duration-200">
+                            {m.text}
+                          </div>
+                          {m.mediaUrl && (
+                            <span className="text-[10px] text-slate-400 mt-1 px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800">
+                              {m.mediaUrl}
+                            </span>
+                          )}
+                        </div>
+                      )}
+
                       {m.mine && (
-                        <div className="text-right px-1">
-                          <span className="text-[10px] text-slate-400">Seen</span>
+                        <div className="text-right px-1 flex items-center justify-end gap-1 select-none">
+                          <span className="text-[10px] text-slate-400">{m.time}</span>
+                          {m.status === "read" ? (
+                            <span className="text-[11px] font-bold text-[#5b4df2] dark:text-indigo-400 tracking-tighter" title="Seen">✓✓</span>
+                          ) : m.status === "delivered" ? (
+                            <span className="text-[11px] font-bold text-slate-400 dark:text-slate-500 tracking-tighter" title="Delivered">✓✓</span>
+                          ) : (
+                            <span className="text-[11px] font-bold text-slate-400 dark:text-slate-500" title="Sent">✓</span>
+                          )}
                         </div>
                       )}
                     </div>
@@ -3755,9 +4001,43 @@ export default function Home() {
                 <div ref={bottomRef} />
               </div>
 
-              {/* Composer: Input + Photo upload + Voice note + Send */}
-              <div className="p-3 sm:p-4 bg-white dark:bg-slate-900 border-t border-slate-200/80 dark:border-slate-800 space-y-3">
+              {/* Composer: Input + Photo upload + Voice note + Stickers + Send */}
+              <div className="p-3 sm:p-4 bg-white dark:bg-slate-900 border-t border-slate-200/80 dark:border-slate-800 space-y-3 relative">
                 
+                {/* Sticker Popover Grid */}
+                {showStickerPicker && (
+                  <div className="p-3 bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-xl space-y-2 animate-in fade-in zoom-in-95">
+                    <div className="flex items-center justify-between pb-1.5 border-b border-slate-100 dark:border-slate-700/60">
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                        <span>✨</span> Expressive Stickers
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setShowStickerPicker(false)}
+                        className="w-5 h-5 rounded-full hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 flex items-center justify-center text-xs"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-4 sm:grid-cols-8 gap-2 p-1">
+                      {STICKERS.map((st) => (
+                        <button
+                          key={st.id}
+                          type="button"
+                          onClick={() => sendSticker(st.emoji, st.label)}
+                          className="flex flex-col items-center justify-center p-2 rounded-2xl hover:bg-indigo-50 dark:hover:bg-slate-700/80 transition-all hover:scale-110 active:scale-95 group cursor-pointer"
+                          title={st.label}
+                        >
+                          <span className="text-3xl select-none filter drop-shadow-2xs">{st.emoji}</span>
+                          <span className="text-[9px] text-slate-400 group-hover:text-[#5b4df2] dark:group-hover:text-indigo-400 truncate max-w-full mt-1">
+                            {st.label}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {/* Active Voice Recording Bar */}
                 {isRecordingAudio ? (
                   <div className="flex items-center justify-between gap-3 bg-rose-50 dark:bg-rose-950/40 rounded-2xl px-4 py-2.5 border border-rose-200 dark:border-rose-900/60 animate-in fade-in">
@@ -3786,6 +4066,19 @@ export default function Home() {
                 ) : (
                   <div className="flex items-center gap-2 bg-slate-50 dark:bg-slate-800 rounded-2xl px-3 py-2 border border-slate-200 dark:border-slate-700 focus-within:border-[#5b4df2] focus-within:bg-white dark:focus-within:bg-slate-800 transition-all">
                     
+                    {/* Sticker button */}
+                    <button
+                      type="button"
+                      onClick={() => setShowStickerPicker((v) => !v)}
+                      className={`w-8 h-8 rounded-xl hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center justify-center transition-colors cursor-pointer text-base ${
+                        showStickerPicker ? "bg-indigo-100 dark:bg-slate-700 text-[#5b4df2]" : "text-slate-500 dark:text-slate-400"
+                      }`}
+                      title="Send sticker"
+                      aria-label="Send sticker"
+                    >
+                      ✨
+                    </button>
+
                     {/* Photo upload button */}
                     <button
                       onClick={() => fileInputRef.current?.click()}
