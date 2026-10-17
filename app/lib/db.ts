@@ -278,3 +278,152 @@ export async function fetchMatchHistory(userId: string | null): Promise<MatchHis
 
   return [];
 }
+
+export interface DirectMessageRecord {
+  id: string;
+  conversation_key: string;
+  sender_handle: string;
+  receiver_handle: string;
+  message_type: "text" | "image" | "audio";
+  text?: string;
+  media_url?: string;
+  created_at: string;
+}
+
+/**
+ * Generates a normalized, alphabetical conversation key for a pair of handles.
+ */
+export function getConversationKey(h1: string, h2: string): string {
+  const norm1 = String(h1 || "").trim().toLowerCase().replace(/^@/, "");
+  const norm2 = String(h2 || "").trim().toLowerCase().replace(/^@/, "");
+  return [norm1, norm2].sort().join(":");
+}
+
+/**
+ * Saves a direct chat message to Supabase and local cache.
+ */
+export async function saveDirectMessage(params: {
+  senderHandle: string;
+  receiverHandle: string;
+  senderId?: string | null;
+  receiverId?: string | null;
+  messageType?: "text" | "image" | "audio";
+  text?: string;
+  mediaUrl?: string;
+}) {
+  const { senderHandle, receiverHandle, senderId, receiverId, messageType = "text", text, mediaUrl } = params;
+  if (!senderHandle || !receiverHandle) return;
+
+  const conversationKey = getConversationKey(senderHandle, receiverHandle);
+  const now = new Date().toISOString();
+
+  // 1. Cache locally
+  if (typeof window !== "undefined") {
+    try {
+      const storageKey = `qs_chat_${conversationKey}`;
+      const prev = localStorage.getItem(storageKey);
+      const list: DirectMessageRecord[] = prev ? JSON.parse(prev) : [];
+      list.push({
+        id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+        conversation_key: conversationKey,
+        sender_handle: senderHandle.replace(/^@/, ""),
+        receiver_handle: receiverHandle.replace(/^@/, ""),
+        message_type: messageType,
+        text,
+        media_url: mediaUrl,
+        created_at: now,
+      });
+      localStorage.setItem(storageKey, JSON.stringify(list.slice(-100)));
+    } catch {
+      // ignore
+    }
+  }
+
+  // 2. Persist to Supabase
+  if (supabase) {
+    try {
+      await supabase.from("direct_messages").insert([
+        {
+          conversation_key: conversationKey,
+          sender_handle: senderHandle.replace(/^@/, ""),
+          receiver_handle: receiverHandle.replace(/^@/, ""),
+          sender_id: senderId || null,
+          receiver_id: receiverId || null,
+          message_type: messageType,
+          text: text || null,
+          media_url: mediaUrl || null,
+        },
+      ]);
+    } catch (err) {
+      console.warn("Error saving direct message:", err);
+    }
+  }
+}
+
+/**
+ * Fetches the complete message history between two handles.
+ */
+export async function fetchDirectChatHistory(myHandle: string, partnerHandle: string): Promise<{
+  mine: boolean;
+  type?: "text" | "image" | "audio";
+  text: string;
+  mediaUrl?: string;
+  time: string;
+}[]> {
+  const conversationKey = getConversationKey(myHandle, partnerHandle);
+  const cleanMyHandle = myHandle.trim().toLowerCase().replace(/^@/, "");
+
+  // 1. Fetch from Supabase
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from("direct_messages")
+        .select("*")
+        .eq("conversation_key", conversationKey)
+        .order("created_at", { ascending: true })
+        .limit(100);
+
+      if (!error && data && data.length > 0) {
+        return data.map((d: DirectMessageRecord) => {
+          const dTime = new Date(d.created_at);
+          const timeStr = `${dTime.getHours().toString().padStart(2, "0")}:${dTime.getMinutes().toString().padStart(2, "0")}`;
+          return {
+            mine: d.sender_handle.toLowerCase() === cleanMyHandle,
+            type: d.message_type || "text",
+            text: d.text || "",
+            mediaUrl: d.media_url,
+            time: timeStr,
+          };
+        });
+      }
+    } catch (err) {
+      console.warn("Error fetching direct messages:", err);
+    }
+  }
+
+  // 2. Fallback to local storage
+  if (typeof window !== "undefined") {
+    try {
+      const storageKey = `qs_chat_${conversationKey}`;
+      const local = localStorage.getItem(storageKey);
+      if (local) {
+        const list: DirectMessageRecord[] = JSON.parse(local);
+        return list.map((d) => {
+          const dTime = new Date(d.created_at);
+          const timeStr = `${dTime.getHours().toString().padStart(2, "0")}:${dTime.getMinutes().toString().padStart(2, "0")}`;
+          return {
+            mine: d.sender_handle.toLowerCase() === cleanMyHandle,
+            type: d.message_type || "text",
+            text: d.text || "",
+            mediaUrl: d.media_url,
+            time: timeStr,
+          };
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return [];
+}

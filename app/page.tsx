@@ -8,6 +8,8 @@ import {
   saveFriendship,
   fetchFriends,
   fetchMatchHistory,
+  saveDirectMessage,
+  fetchDirectChatHistory,
   FriendItem,
   MatchHistoryItem,
 } from "./lib/db";
@@ -158,6 +160,15 @@ export default function Home() {
   const [currentMember, setCurrentMember] = useState<AuthMember | null>(null);
   const [partnerIsMember, setPartnerIsMember] = useState(false);
   const [partnerHandle, setPartnerHandle] = useState<string | null>(null);
+
+  const currentMemberRef = useRef(currentMember);
+  useEffect(() => { currentMemberRef.current = currentMember; }, [currentMember]);
+
+  const partnerRef = useRef(partner);
+  useEffect(() => { partnerRef.current = partner; }, [partner]);
+
+  const partnerHandleRef = useRef(partnerHandle);
+  useEffect(() => { partnerHandleRef.current = partnerHandle; }, [partnerHandle]);
 
   // Auth & Claim Handle Modal states
   const [showAuthModal, setShowAuthModal] = useState(false);
@@ -545,6 +556,17 @@ export default function Home() {
         setMsgs([]);
         setPhase("chat");
 
+        // Load stored conversation history if chatting with a registered member or friend
+        const activeMyHandle = currentMemberRef.current?.handle;
+        const targetHandle = d.handle || (d.nick && d.nick !== "Stranger" ? d.nick : null);
+        if (activeMyHandle && targetHandle) {
+          fetchDirectChatHistory(activeMyHandle, targetHandle).then((history) => {
+            if (history && history.length > 0) {
+              setMsgs(history);
+            }
+          });
+        }
+
         // Broad stable region locked per match
         const chosenRegion = BROAD_REGIONS[Math.floor(Math.random() * BROAD_REGIONS.length)];
         setPartnerLocation(chosenRegion);
@@ -577,6 +599,19 @@ export default function Home() {
             time: payload.time || timeStr,
           },
         ]);
+      }
+
+      // Save incoming message to direct_messages if chatting with member/friend
+      const activeMyHandle = currentMemberRef.current?.handle;
+      const targetPartner = partnerHandleRef.current || partnerRef.current;
+      if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+        saveDirectMessage({
+          senderHandle: targetPartner,
+          receiverHandle: activeMyHandle,
+          messageType: typeof payload === "object" ? payload.type : "text",
+          text: typeof payload === "string" ? payload : payload?.text,
+          mediaUrl: typeof payload === "object" ? payload.mediaUrl : undefined,
+        });
       }
 
       // Send background / tab-away notification if not actively looking at chat
@@ -925,6 +960,19 @@ export default function Home() {
     socketRef.current?.emit("message", text);
     setMsgs((m) => [...m, payload]);
     if (!overrideText) setDraft("");
+
+    // Persist chat message for logged-in members
+    const activeMyHandle = currentMember?.handle;
+    const targetPartner = partnerHandle || partner;
+    if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+      saveDirectMessage({
+        senderHandle: activeMyHandle,
+        receiverHandle: targetPartner,
+        senderId: userId,
+        messageType: "text",
+        text,
+      });
+    }
   };
 
   // Image Upload & Compress Handler
@@ -978,6 +1026,20 @@ export default function Home() {
         setMsgs((m) => [...m, { mine: true, ...payload }]);
         setShowToast("Photo sent!");
         setTimeout(() => setShowToast(null), 2000);
+
+        // Persist photo message for logged-in members
+        const activeMyHandle = currentMember?.handle;
+        const targetPartner = partnerHandle || partner;
+        if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+          saveDirectMessage({
+            senderHandle: activeMyHandle,
+            receiverHandle: targetPartner,
+            senderId: userId,
+            messageType: "image",
+            text: "Photo",
+            mediaUrl: compressedBase64,
+          });
+        }
       };
       img.src = event.target?.result as string;
     };
@@ -1041,6 +1103,20 @@ export default function Home() {
         setMsgs((m) => [...m, { mine: true, ...payload }]);
         setShowToast("Voice message sent!");
         setTimeout(() => setShowToast(null), 2000);
+
+        // Persist voice note for logged-in members
+        const activeMyHandle = currentMember?.handle;
+        const targetPartner = partnerHandle || partner;
+        if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+          saveDirectMessage({
+            senderHandle: activeMyHandle,
+            receiverHandle: targetPartner,
+            senderId: userId,
+            messageType: "audio",
+            text: `Voice note (${recordingSeconds}s)`,
+            mediaUrl: base64Audio,
+          });
+        }
       };
       reader.readAsDataURL(blob);
     };
@@ -2702,9 +2778,20 @@ export default function Home() {
                     {historyList.map((item) => (
                       <div
                         key={item.id}
-                        onClick={() => {
+                        onClick={async () => {
+                          const targetHandle = item.partner_handle || item.partner_name;
                           setPartner(item.partner_name);
+                          setPartnerHandle(targetHandle);
+                          setPartnerIsMember(!!item.is_member);
                           setPhase("chat");
+                          if (currentMember?.handle) {
+                            const history = await fetchDirectChatHistory(currentMember.handle, targetHandle);
+                            if (history && history.length > 0) {
+                              setMsgs(history);
+                            } else {
+                              setMsgs([]);
+                            }
+                          }
                         }}
                         className="py-4 flex items-center justify-between hover:bg-slate-50/80 dark:hover:bg-slate-800/50 -mx-3 px-3 rounded-2xl transition-all cursor-pointer"
                       >
@@ -2765,7 +2852,7 @@ export default function Home() {
                             <span className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate">{f.friend_name}</span>
                           </div>
                           <button
-                            onClick={() => startDirectChat(f.friend_name)}
+                            onClick={() => startDirectChat(f.friend_handle || f.friend_name)}
                             className="px-3 py-1 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] text-white text-[11px] font-semibold flex items-center gap-1 transition-all cursor-pointer shadow-2xs shrink-0"
                             title={`Chat directly with ${f.friend_name}`}
                           >
@@ -3139,9 +3226,20 @@ export default function Home() {
                       .map((h) => (
                         <div
                           key={h.id}
-                          onClick={() => {
+                          onClick={async () => {
+                            const targetHandle = h.partner_handle || h.partner_name;
                             setPartner(h.partner_name);
+                            setPartnerHandle(targetHandle);
+                            setPartnerIsMember(!!h.is_member);
                             setMobileDrawerOpen(false);
+                            if (currentMember?.handle) {
+                              const history = await fetchDirectChatHistory(currentMember.handle, targetHandle);
+                              if (history && history.length > 0) {
+                                setMsgs(history);
+                              } else {
+                                setMsgs([]);
+                              }
+                            }
                           }}
                           className="p-3 rounded-2xl hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors flex items-center gap-3 cursor-pointer"
                         >

@@ -77,3 +77,30 @@ CREATE POLICY "Public read match_history" ON public.match_history FOR SELECT USI
 
 DROP POLICY IF EXISTS "Public insert match_history" ON public.match_history;
 CREATE POLICY "Public insert match_history" ON public.match_history FOR INSERT WITH CHECK (true);
+
+-- 6. Direct Messages Table (Persistent Chat-wise Storage for Logged-In Members & Friends)
+CREATE TABLE IF NOT EXISTS public.direct_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  conversation_key TEXT NOT NULL,
+  sender_handle TEXT NOT NULL,
+  receiver_handle TEXT NOT NULL,
+  sender_id TEXT,
+  receiver_id TEXT,
+  message_type TEXT CHECK (message_type IN ('text', 'image', 'audio')) DEFAULT 'text',
+  text TEXT,
+  media_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Index for rapid conversation retrieval
+CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation_key 
+ON public.direct_messages(conversation_key, created_at ASC);
+
+-- Direct Messages RLS
+ALTER TABLE public.direct_messages ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Public read direct_messages" ON public.direct_messages;
+CREATE POLICY "Public read direct_messages" ON public.direct_messages FOR SELECT USING (true);
+
+DROP POLICY IF EXISTS "Public insert direct_messages" ON public.direct_messages;
+CREATE POLICY "Public insert direct_messages" ON public.direct_messages FOR INSERT WITH CHECK (true);
+
