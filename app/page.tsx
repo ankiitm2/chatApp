@@ -170,6 +170,8 @@ export default function Home() {
   const [claimHandleStatus, setClaimHandleStatus] = useState<{ available: boolean; reason?: string } | null>(null);
   const [claimHandleSuggestions, setClaimHandleSuggestions] = useState<string[]>([]);
   const checkHandleTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [guestNickWarning, setGuestNickWarning] = useState<string | null>(null);
+  const guestNickCheckTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Supabase User & Data state (Real only, NO dummy data)
   const [userId, setUserId] = useState<string | null>(null);
@@ -248,6 +250,8 @@ export default function Home() {
 
     // Check for Supabase OAuth callback (e.g. returning from Google login)
     if (supabase) {
+      const isOAuthRedirect = typeof window !== "undefined" && (window.location.hash.includes("access_token") || window.location.search.includes("code="));
+
       syncSupabaseSession().then(({ member, needsHandle, user }) => {
         // Clean URL tokens from browser address bar
         if (typeof window !== "undefined" && (window.location.hash || window.location.search.includes("code="))) {
@@ -262,13 +266,18 @@ export default function Home() {
           fetchMatchHistory(member.id).then(setHistoryList);
           setShowToast(`Welcome back, @${member.handle}!`);
           setTimeout(() => setShowToast(null), 3000);
+
+          // If coming from active OAuth login redirect, immediately enter searching screen!
+          if (isOAuthRedirect) {
+            find(member.handle, member);
+          }
         } else if (needsHandle && user) {
           // User authenticated with Google, but needs to claim their handle
           const seed = (user.user_metadata?.full_name || user.email?.split("@")[0] || "member")
             .toLowerCase()
             .replace(/[^a-z0-9]/g, "");
           openClaimHandleModal(seed);
-          setShowToast("Google connected! Please choose your permanent handle.");
+          setShowToast("Google connected! Please choose your permanent handle to start matching.");
           setTimeout(() => setShowToast(null), 4000);
         }
       });
@@ -680,7 +689,27 @@ export default function Home() {
     setTopicInputError(null);
   };
 
+  const handleGuestNickChange = (val: string) => {
+    setNick(val);
+    setGuestNickWarning(null);
+    if (currentMember || !val.trim()) return;
+
+    if (guestNickCheckTimerRef.current) clearTimeout(guestNickCheckTimerRef.current);
+    guestNickCheckTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/handle/check?handle=${encodeURIComponent(val.trim())}`);
+        const data = await res.json();
+        if (data.available === false && (data.reason?.toLowerCase().includes("taken") || data.reason?.toLowerCase().includes("reserved"))) {
+          setGuestNickWarning(`"@${val.trim()}" is reserved by a Member. Please choose another name or sign in.`);
+        }
+      } catch {
+        // fallback
+      }
+    }, 400);
+  };
+
   const shuffleNickname = () => {
+    setGuestNickWarning(null);
     const filtered = ANONYMOUS_NAMES.filter((n) => n !== nick);
     const chosen = filtered[Math.floor(Math.random() * filtered.length)];
     setNick(chosen);
@@ -694,27 +723,46 @@ export default function Home() {
     setTimeout(() => setShowToast(null), 2500);
   };
 
-  const find = async () => {
+  const find = async (overrideNick?: string, overrideMember?: AuthMember | null) => {
     if (!isAgeConfirmed) return;
+    setGuestNickWarning(null);
+
+    const activeMember = overrideMember !== undefined ? overrideMember : currentMember;
+    const activeNick = (overrideNick ?? (activeMember?.handle || nick)).trim() || "Clover";
+
+    // If user is a Guest, block them from using any registered Member handle!
+    if (!activeMember) {
+      try {
+        const checkRes = await fetch(`/api/handle/check?handle=${encodeURIComponent(activeNick)}`);
+        const checkData = await checkRes.json();
+        if (checkData.available === false && (checkData.reason?.toLowerCase().includes("taken") || checkData.reason?.toLowerCase().includes("reserved"))) {
+          setGuestNickWarning(`"${activeNick}" is reserved by a registered Member. Please pick another name or sign in.`);
+          return;
+        }
+      } catch {
+        // network fallback
+      }
+    }
+
     cleanupMediaAndPeer();
     setPhase("waiting");
 
     const uid = await getOrCreateUserProfile(
-      nick || "Clover",
+      activeNick,
       gender,
       selectedTopics,
-      currentMember?.handle,
-      !!currentMember?.isMember
+      activeMember?.handle,
+      !!activeMember?.isMember
     );
     if (uid) setUserId(uid);
 
     socketRef.current?.emit("find", {
-      nick: nick || "Clover",
+      nick: activeNick,
       gender,
       interests: selectedTopics,
       style: conversationStyle,
-      isMember: !!currentMember?.isMember,
-      handle: currentMember?.handle || null,
+      isMember: !!activeMember?.isMember,
+      handle: activeMember?.handle || null,
     });
   };
 
@@ -1033,6 +1081,9 @@ export default function Home() {
       setShowAuthModal(false);
       setShowToast(`@${data.handle} reserved permanently! 🎉`);
       setTimeout(() => setShowToast(null), 3500);
+      if (phase === "setup") {
+        find(data.handle, updated);
+      }
     } catch {
       setAuthError("Failed to claim handle. Please try again.");
     } finally {
@@ -1834,15 +1885,17 @@ export default function Home() {
               </span>
 
               {currentMember ? (
-                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200/80 dark:border-indigo-800/80 text-xs">
-                  <span className="font-bold text-[#5b4df2] dark:text-indigo-400">@{currentMember.handle}</span>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#5b4df2] text-white font-semibold">Member</span>
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200/80 dark:border-indigo-800/80 text-xs">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-bold text-[#5b4df2] dark:text-indigo-400">@{currentMember.handle}</span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#5b4df2] text-white font-semibold">Member</span>
+                  </div>
                   <button
                     onClick={handleLogout}
-                    className="ml-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                    className="ml-1 pl-1.5 border-l border-indigo-200 dark:border-indigo-800 text-[11px] font-semibold text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 cursor-pointer transition-colors"
                     title="Sign out of account"
                   >
-                    ✕
+                    Sign out
                   </button>
                 </div>
               ) : (
@@ -2011,7 +2064,7 @@ export default function Home() {
                           placeholder="e.g. Clover"
                           value={nick}
                           maxLength={20}
-                          onChange={(e) => setNick(e.target.value)}
+                          onChange={(e) => handleGuestNickChange(e.target.value)}
                         />
                         {currentMember && (
                           <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-[#5b4df2] flex items-center gap-1 bg-indigo-50 dark:bg-indigo-950 px-2 py-0.5 rounded-md">
@@ -2035,6 +2088,13 @@ export default function Home() {
                       )}
                     </div>
 
+                    {guestNickWarning && (
+                      <p className="text-xs text-rose-500 font-semibold flex items-center gap-1.5 pt-0.5">
+                        <span>⚠️</span>
+                        <span>{guestNickWarning}</span>
+                      </p>
+                    )}
+
                     {/* Handle Reservation / Account Status Link */}
                     {currentMember ? (
                       <div className="flex items-center justify-between text-[11px] text-indigo-700 dark:text-indigo-300 font-medium bg-indigo-50/80 dark:bg-indigo-950/40 px-3 py-2 rounded-xl border border-indigo-100 dark:border-indigo-900/50">
@@ -2042,13 +2102,23 @@ export default function Home() {
                           <span>✓</span>
                           <span>Reserved as <strong>@{currentMember.handle}</strong></span>
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => openClaimHandleModal(currentMember.handle)}
-                          className="hover:underline font-semibold text-[#5b4df2] dark:text-indigo-400 cursor-pointer"
-                        >
-                          Change handle
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => openClaimHandleModal(currentMember.handle)}
+                            className="hover:underline font-semibold text-[#5b4df2] dark:text-indigo-400 cursor-pointer"
+                          >
+                            Change
+                          </button>
+                          <span className="text-slate-300 dark:text-slate-700">•</span>
+                          <button
+                            type="button"
+                            onClick={handleLogout}
+                            className="hover:underline text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 font-semibold cursor-pointer"
+                          >
+                            Log out
+                          </button>
+                        </div>
                       </div>
                     ) : (
                       <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
@@ -2263,7 +2333,7 @@ export default function Home() {
                       )}
 
                       <button
-                        onClick={find}
+                        onClick={() => find()}
                         disabled={!isAgeConfirmed}
                         className="flex-1 py-3.5 px-4 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] disabled:opacity-40 disabled:hover:bg-[#5b4df2] text-white font-semibold text-sm tracking-wide shadow-md shadow-[#5b4df2]/25 transition-all cursor-pointer flex items-center justify-center gap-2 min-h-[44px] active:scale-[0.98]"
                       >
@@ -2867,7 +2937,25 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="p-4 border-t border-slate-100 dark:border-slate-800">
+              <div className="p-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
+                {currentMember && (
+                  <div className="flex items-center justify-between p-2.5 rounded-2xl bg-indigo-50/70 dark:bg-indigo-950/40 border border-indigo-100 dark:border-indigo-900/50">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0"></span>
+                      <div className="min-w-0">
+                        <p className="text-xs font-bold text-slate-900 dark:text-white truncate">@{currentMember.handle}</p>
+                        <p className="text-[10px] text-[#5b4df2] dark:text-indigo-400 font-medium">Logged in Member</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleLogout}
+                      className="text-[11px] font-semibold text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 hover:underline cursor-pointer shrink-0 ml-2"
+                    >
+                      Log out
+                    </button>
+                  </div>
+                )}
+
                 <div className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700/60 space-y-1">
                   <h4 className="text-xs font-bold text-slate-900 dark:text-white">Your safety matters</h4>
                   <button
