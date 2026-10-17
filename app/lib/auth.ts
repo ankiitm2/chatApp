@@ -175,6 +175,57 @@ export async function signInOAuth(provider: "google" | "apple"): Promise<{ succe
 }
 
 /**
+ * Synchronizes and retrieves the current authenticated Supabase session,
+ * checking whether the user already has a claimed handle in profiles.
+ */
+export async function syncSupabaseSession(): Promise<{
+  member: AuthMember | null;
+  needsHandle: boolean;
+  user: any;
+}> {
+  if (!supabase) return { member: null, needsHandle: false, user: null };
+
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session || !session.user) {
+      return { member: null, needsHandle: false, user: null };
+    }
+
+    const authUser = session.user;
+    const email = authUser.email || "";
+
+    // Check if user has an existing claimed handle in profiles
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("id, handle, username, is_member, last_renamed_at")
+      .or(`auth_user_id.eq.${authUser.id},email.eq.${email}`)
+      .maybeSingle();
+
+    if (profile && profile.handle) {
+      const member: AuthMember = {
+        id: profile.id,
+        email,
+        handle: profile.handle,
+        isMember: true,
+        lastRenamedAt: profile.last_renamed_at,
+      };
+      saveStoredMember(member);
+      return { member, needsHandle: false, user: authUser };
+    }
+
+    // Authenticated, but no handle claimed yet!
+    return {
+      member: null,
+      needsHandle: true,
+      user: authUser,
+    };
+  } catch (err) {
+    console.warn("Error syncing Supabase session:", err);
+    return { member: null, needsHandle: false, user: null };
+  }
+}
+
+/**
  * Log out current member.
  */
 export async function logoutMember(): Promise<void> {
@@ -187,3 +238,4 @@ export async function logoutMember(): Promise<void> {
     }
   }
 }
+

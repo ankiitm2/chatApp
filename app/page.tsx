@@ -19,8 +19,10 @@ import {
   sendMagicLinkOrCode,
   verifyEmailCode,
   signInOAuth,
+  syncSupabaseSession,
   logoutMember,
 } from "./lib/auth";
+import { supabase } from "./lib/supabase";
 import {
   validateHandle,
   normalizeHandle,
@@ -228,7 +230,7 @@ export default function Home() {
     }
   };
 
-  // Load real member session, friends, and history on mount
+  // Load real member session, friends, and history on mount (and sync Supabase OAuth redirect)
   useEffect(() => {
     const stored = getStoredMember();
     if (stored) {
@@ -242,6 +244,61 @@ export default function Home() {
     } else {
       fetchFriends(null).then(setFriendsList);
       fetchMatchHistory(null).then(setHistoryList);
+    }
+
+    // Check for Supabase OAuth callback (e.g. returning from Google login)
+    if (supabase) {
+      syncSupabaseSession().then(({ member, needsHandle, user }) => {
+        // Clean URL tokens from browser address bar
+        if (typeof window !== "undefined" && (window.location.hash || window.location.search.includes("code="))) {
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+
+        if (member) {
+          setCurrentMember(member);
+          setNick(member.handle);
+          setUserId(member.id);
+          fetchFriends(member.id).then(setFriendsList);
+          fetchMatchHistory(member.id).then(setHistoryList);
+          setShowToast(`Welcome back, @${member.handle}!`);
+          setTimeout(() => setShowToast(null), 3000);
+        } else if (needsHandle && user) {
+          // User authenticated with Google, but needs to claim their handle
+          const seed = (user.user_metadata?.full_name || user.email?.split("@")[0] || "member")
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, "");
+          openClaimHandleModal(seed);
+          setShowToast("Google connected! Please choose your permanent handle.");
+          setTimeout(() => setShowToast(null), 4000);
+        }
+      });
+
+      const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+        if (event === "SIGNED_IN" && session?.user) {
+          const res = await syncSupabaseSession();
+          if (res.member) {
+            setCurrentMember(res.member);
+            setNick(res.member.handle);
+            setUserId(res.member.id);
+            setShowToast(`Signed in as @${res.member.handle}`);
+            setTimeout(() => setShowToast(null), 3000);
+          } else if (res.needsHandle) {
+            const seed = (session.user.user_metadata?.full_name || session.user.email?.split("@")[0] || "member")
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "");
+            openClaimHandleModal(seed);
+            setShowToast("Google connected! Please choose your permanent handle.");
+            setTimeout(() => setShowToast(null), 4000);
+          }
+        } else if (event === "SIGNED_OUT") {
+          setCurrentMember(null);
+          setNick("Clover");
+        }
+      });
+
+      return () => {
+        authListener.subscription.unsubscribe();
+      };
     }
   }, []);
 
@@ -936,13 +993,24 @@ export default function Home() {
     setAuthLoading(true);
     setAuthError(null);
     try {
+      let authUserId = null;
+      let userEmail = currentMember?.email;
+      if (supabase) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          authUserId = user.id;
+          userEmail = user.email || userEmail;
+        }
+      }
+
       const res = await fetch("/api/handle/claim", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           handle: target,
           userId: currentMember?.id || userId,
-          email: currentMember?.email,
+          authUserId,
+          email: userEmail,
         }),
       });
       const data = await res.json();
@@ -953,7 +1021,7 @@ export default function Home() {
 
       const updated: AuthMember = {
         id: data.userId || currentMember?.id || userId || "usr_" + Math.random().toString(36).substring(2, 9),
-        email: currentMember?.email || "anonymous.member@quietsignal.app",
+        email: userEmail || "anonymous.member@quietsignal.app",
         handle: data.handle,
         isMember: true,
         lastRenamedAt: new Date().toISOString(),
@@ -961,6 +1029,7 @@ export default function Home() {
       saveStoredMember(updated);
       setCurrentMember(updated);
       setNick(data.handle);
+      setUserId(updated.id);
       setShowAuthModal(false);
       setShowToast(`@${data.handle} reserved permanently! 🎉`);
       setTimeout(() => setShowToast(null), 3500);
