@@ -27,6 +27,8 @@ const io = new Server(httpServer, {
 
 const waiting = []; // { id, nick, interests }
 const partners = new Map(); // socketId -> socketId
+const onlineUsers = new Map(); // handle_normalized -> { socketId, nick, handle, isMember }
+const socketToUser = new Map(); // socketId -> handle_normalized
 
 const dequeue = (id) => {
   const i = waiting.findIndex((w) => w.id === id);
@@ -165,9 +167,95 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("register-identity", (info) => {
+    if (info && info.handle) {
+      const norm = String(info.handle).toLowerCase().trim().replace(/^@/, "");
+      onlineUsers.set(norm, {
+        socketId: socket.id,
+        nick: info.nick || info.handle,
+        handle: info.handle,
+        isMember: !!info.isMember,
+      });
+      socketToUser.set(socket.id, norm);
+      socket.emit("registered", { handle: norm });
+    }
+  });
+
+  socket.on("direct-chat-request", ({ targetHandle, senderInfo }) => {
+    const norm = String(targetHandle || "").toLowerCase().trim().replace(/^@/, "");
+    const target = onlineUsers.get(norm);
+
+    if (!target) {
+      socket.emit("direct-chat-error", { message: `@${targetHandle} is currently offline.` });
+      return;
+    }
+
+    if (target.socketId === socket.id) {
+      socket.emit("direct-chat-error", { message: "You cannot chat with yourself." });
+      return;
+    }
+
+    if (partners.has(target.socketId)) {
+      socket.emit("direct-chat-error", { message: `@${targetHandle} is currently in another conversation.` });
+      return;
+    }
+
+    io.to(target.socketId).emit("direct-chat-invite", {
+      fromSocketId: socket.id,
+      fromNick: senderInfo?.nick || "A friend",
+      fromHandle: senderInfo?.handle || null,
+      fromIsMember: !!senderInfo?.isMember,
+    });
+  });
+
+  socket.on("direct-chat-response", ({ accepted, fromSocketId, targetInfo }) => {
+    if (!accepted) {
+      io.to(fromSocketId).emit("direct-chat-error", { message: "The invitation was declined." });
+      return;
+    }
+
+    unpair(socket.id);
+    dequeue(socket.id);
+    unpair(fromSocketId);
+    dequeue(fromSocketId);
+
+    partners.set(socket.id, fromSocketId);
+    partners.set(fromSocketId, socket.id);
+
+    const senderHandleNorm = socketToUser.get(fromSocketId);
+    const sender = senderHandleNorm ? onlineUsers.get(senderHandleNorm) : null;
+
+    io.to(fromSocketId).emit("matched", {
+      nick: targetInfo?.nick || "Friend",
+      gender: "other",
+      interests: ["Direct Connection"],
+      style: "text",
+      isMember: !!targetInfo?.isMember,
+      handle: targetInfo?.handle || null,
+      common: ["Direct Connection"],
+      isInitiator: true,
+    });
+
+    io.to(socket.id).emit("matched", {
+      nick: sender?.nick || "Friend",
+      gender: "other",
+      interests: ["Direct Connection"],
+      style: "text",
+      isMember: !!sender?.isMember,
+      handle: sender?.handle || null,
+      common: ["Direct Connection"],
+      isInitiator: false,
+    });
+  });
+
   const leave = () => {
     unpair(socket.id);
     dequeue(socket.id);
+    const h = socketToUser.get(socket.id);
+    if (h) {
+      onlineUsers.delete(h);
+      socketToUser.delete(socket.id);
+    }
   };
   socket.on("leave", leave);
   socket.on("disconnect", () => {

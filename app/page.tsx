@@ -199,6 +199,17 @@ export default function Home() {
   const [incomingCountdown, setIncomingCountdown] = useState(25);
   const [previewCameraMuted, setPreviewCameraMuted] = useState(false);
 
+  // User Search & Direct Chat states
+  const [searchHandleQuery, setSearchHandleQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<{ id: string; handle: string; isMember: boolean }[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [incomingDirectInvite, setIncomingDirectInvite] = useState<{
+    fromSocketId: string;
+    fromNick: string;
+    fromHandle: string | null;
+    fromIsMember: boolean;
+  } | null>(null);
+
   // Video calling states
   const [isVideoActive, setIsVideoActive] = useState(false);
   const [hasLocalMedia, setHasLocalMedia] = useState(false);
@@ -648,6 +659,20 @@ export default function Home() {
       setPhase("ended");
     });
 
+    s.on("direct-chat-invite", (invite: {
+      fromSocketId: string;
+      fromNick: string;
+      fromHandle: string | null;
+      fromIsMember: boolean;
+    }) => {
+      setIncomingDirectInvite(invite);
+    });
+
+    s.on("direct-chat-error", (err: { message: string }) => {
+      setShowToast(err.message || "Could not connect");
+      setTimeout(() => setShowToast(null), 4000);
+    });
+
     return () => {
       cleanupMediaAndPeer();
       s.disconnect();
@@ -657,6 +682,64 @@ export default function Home() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [msgs]);
+
+  // Register identity with server whenever member or nickname updates
+  useEffect(() => {
+    if (socketRef.current) {
+      socketRef.current.emit("register-identity", {
+        handle: currentMember?.handle || nick,
+        nick,
+        isMember: !!currentMember?.isMember,
+      });
+    }
+  }, [currentMember, nick]);
+
+  const respondDirectChat = (accepted: boolean) => {
+    if (!incomingDirectInvite) return;
+    socketRef.current?.emit("direct-chat-response", {
+      accepted,
+      fromSocketId: incomingDirectInvite.fromSocketId,
+      targetInfo: {
+        nick,
+        handle: currentMember?.handle || null,
+        isMember: !!currentMember?.isMember,
+      },
+    });
+    setIncomingDirectInvite(null);
+  };
+
+  const startDirectChat = (targetHandle: string) => {
+    if (!targetHandle) return;
+    const clean = targetHandle.trim().replace(/^@/, "");
+    socketRef.current?.emit("direct-chat-request", {
+      targetHandle: clean,
+      senderInfo: {
+        nick,
+        handle: currentMember?.handle || null,
+        isMember: !!currentMember?.isMember,
+      },
+    });
+    setShowToast(`Chat invite sent to @${clean}...`);
+    setTimeout(() => setShowToast(null), 3500);
+  };
+
+  const searchUsersByHandle = async (q: string) => {
+    setSearchHandleQuery(q);
+    if (!q.trim() || q.trim().length < 2) {
+      setSearchResults([]);
+      return;
+    }
+    setSearchLoading(true);
+    try {
+      const res = await fetch(`/api/users/search?q=${encodeURIComponent(q.trim())}`);
+      const data = await res.json();
+      setSearchResults(data.users || []);
+    } catch {
+      setSearchResults([]);
+    } finally {
+      setSearchLoading(false);
+    }
+  };
 
   const toggleTopic = (topic: string) => {
     setTopicInputError(null);
@@ -1594,6 +1677,46 @@ export default function Home() {
         </div>
       )}
 
+      {/* Incoming Direct Chat Request Modal */}
+      {incomingDirectInvite && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in"
+        >
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-4 shadow-2xl text-center animate-in zoom-in-95">
+            <div className="w-14 h-14 mx-auto rounded-full bg-indigo-50 dark:bg-indigo-950 flex items-center justify-center text-2xl border border-indigo-200 dark:border-indigo-800">
+              💬
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-slate-900 dark:text-white leading-tight">
+                Direct Chat Request
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 leading-relaxed">
+                <strong className="text-[#5b4df2] dark:text-indigo-400">
+                  {incomingDirectInvite.fromHandle ? `@${incomingDirectInvite.fromHandle}` : incomingDirectInvite.fromNick}
+                </strong>{" "}
+                wants to chat directly with you!
+              </p>
+            </div>
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                onClick={() => respondDirectChat(false)}
+                className="flex-1 py-2.5 px-4 rounded-xl border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+              >
+                Decline
+              </button>
+              <button
+                onClick={() => respondDirectChat(true)}
+                className="flex-1 py-2.5 px-4 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] text-white text-xs font-semibold shadow-md shadow-[#5b4df2]/25 transition-all cursor-pointer"
+              >
+                Accept & Chat
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Auth & Handle Reservation Modal */}
       {showAuthModal && (
         <div
@@ -1865,10 +1988,8 @@ export default function Home() {
         <div className="flex-1 flex flex-col h-full overflow-y-auto bg-white dark:bg-[#0b0f19]">
           <header className="px-6 md:px-10 py-4 flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 sticky top-0 bg-white/90 dark:bg-[#0b0f19]/90 backdrop-blur-md z-20">
             <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                </svg>
+              <div className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs overflow-hidden">
+                <img src="/icons/icon-192.png" alt="Quiet Signal" className="w-full h-full object-cover" />
               </div>
               <div>
                 <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Quiet Signal</h1>
@@ -2473,12 +2594,10 @@ export default function Home() {
             <div className="flex items-center gap-3">
               <button
                 onClick={() => setPhase("setup")}
-                className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs cursor-pointer"
+                className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs overflow-hidden cursor-pointer"
                 title="Home"
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                </svg>
+                <img src="/icons/icon-192.png" alt="Quiet Signal" className="w-full h-full object-cover" />
               </button>
               <div>
                 <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Your conversations</h1>
@@ -2586,16 +2705,71 @@ export default function Home() {
                   ) : (
                     <div className="space-y-2">
                       {friendsList.map((f) => (
-                        <div key={f.id} className="flex items-center justify-between py-1">
-                          <div className="flex items-center gap-2.5">
+                        <div key={f.id} className="flex items-center justify-between py-1.5 px-2 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                          <div className="flex items-center gap-2.5 min-w-0">
                             {renderAvatar(f.friend_name, "w-7 h-7 text-xs")}
-                            <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">{f.friend_name}</span>
+                            <span className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate">{f.friend_name}</span>
                           </div>
-                          <span className="text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 rounded-full font-medium">
-                            Connected
-                          </span>
+                          <button
+                            onClick={() => startDirectChat(f.friend_name)}
+                            className="px-3 py-1 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] text-white text-[11px] font-semibold flex items-center gap-1 transition-all cursor-pointer shadow-2xs shrink-0"
+                            title={`Chat directly with ${f.friend_name}`}
+                          >
+                            <span>💬</span>
+                            <span>Chat</span>
+                          </button>
                         </div>
                       ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Search people by handle */}
+                <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200/80 dark:border-slate-800 p-5 shadow-2xs space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-slate-900 dark:text-white">Find Someone</h4>
+                    <span className="text-[10px] text-slate-400">Direct handle</span>
+                  </div>
+
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={searchHandleQuery}
+                      onChange={(e) => searchUsersByHandle(e.target.value)}
+                      placeholder="Search @handle to chat..."
+                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-[#5b4df2]"
+                    />
+                    {searchLoading && (
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">⏳</span>
+                    )}
+                  </div>
+
+                  {searchHandleQuery.trim().length >= 2 && (
+                    <div className="space-y-1.5 pt-1 max-h-48 overflow-y-auto">
+                      {searchResults.length === 0 && !searchLoading ? (
+                        <p className="text-[11px] text-slate-400 py-1">No member found with that handle.</p>
+                      ) : (
+                        searchResults.map((user) => (
+                          <div
+                            key={user.id}
+                            className="flex items-center justify-between p-2 rounded-xl bg-slate-50/80 dark:bg-slate-800/60 border border-slate-100 dark:border-slate-700/60"
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              {renderAvatar(user.handle, "w-7 h-7 text-xs")}
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-slate-900 dark:text-white truncate">@{user.handle}</p>
+                                <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-indigo-50 dark:bg-indigo-950 text-[#5b4df2] font-semibold">Member</span>
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => startDirectChat(user.handle)}
+                              className="px-2.5 py-1 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] text-white text-[11px] font-semibold transition-all cursor-pointer shadow-2xs shrink-0"
+                            >
+                              Chat
+                            </button>
+                          </div>
+                        ))
+                      )}
                     </div>
                   )}
                 </div>
@@ -2820,12 +2994,10 @@ export default function Home() {
               </button>
               <button
                 onClick={() => setPhase("history")}
-                className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs cursor-pointer"
+                className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs overflow-hidden cursor-pointer"
                 title="View conversations"
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                </svg>
+                <img src="/icons/icon-192.png" alt="Quiet Signal" className="w-full h-full object-cover" />
               </button>
               <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Quiet Signal</h1>
             </div>
