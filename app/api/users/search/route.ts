@@ -16,13 +16,26 @@ export async function GET(req: NextRequest) {
     try {
       const { data, error } = await supabase
         .from("profiles")
-        .select("id, handle, username, is_member, created_at")
+        .select("id, handle, username, is_member, allow_search, created_at")
+        .eq("allow_search", true)
         .or(`handle_normalized.ilike.%${cleanQuery}%,handle.ilike.%${q}%,username.ilike.%${q}%`)
         .limit(10);
 
       if (error) {
-        console.warn("User search error:", error.message);
-        return NextResponse.json({ users: [] });
+        // Fallback for schemas before allow_search migration
+        const { data: fallbackData } = await supabase
+          .from("profiles")
+          .select("id, handle, username, is_member, created_at")
+          .or(`handle_normalized.ilike.%${cleanQuery}%,handle.ilike.%${q}%,username.ilike.%${q}%`)
+          .limit(10);
+
+        return NextResponse.json({
+          users: (fallbackData || []).map((u) => ({
+            id: u.id,
+            handle: u.handle || u.username,
+            isMember: !!u.is_member,
+          })),
+        });
       }
 
       return NextResponse.json({

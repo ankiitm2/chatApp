@@ -16,6 +16,8 @@ import {
   DirectMessageRecord,
   FriendItem,
   MatchHistoryItem,
+  DirectConversationItem,
+  fetchSavedConversations,
 } from "./lib/db";
 import {
   AuthMember,
@@ -117,11 +119,22 @@ const BROAD_REGIONS = [
   "East Coast",
 ];
 
-const ICE_SERVERS = {
+const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+        "turns:openrelay.metered.ca:443?transport=tcp",
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
   ],
+  iceTransportPolicy: "relay", // Force TURN relay mode to prevent IP exposure to peer
 };
 
 export default function Home() {
@@ -151,7 +164,8 @@ export default function Home() {
   const [topicInputError, setTopicInputError] = useState<string | null>(null);
   const [conversationStyle, setConversationStyle] = useState<ConversationStyle>("text");
   const [gender, setGender] = useState<Gender>("other");
-  const [isAgeConfirmed, setIsAgeConfirmed] = useState(true);
+  const [isAgeConfirmed, setIsAgeConfirmed] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
 
   // Mobile multi-step wizard state (Step 1: Identity, Step 2: Topics, Step 3: Style)
   const [mobileStep, setMobileStep] = useState<1 | 2 | 3>(1);
@@ -162,7 +176,12 @@ export default function Home() {
   // Partner info
   const [partner, setPartner] = useState("Stranger");
   const [partnerGender, setPartnerGender] = useState<Gender>("female");
-  const [partnerLocation, setPartnerLocation] = useState("Pacific Northwest");
+  const [partnerLocation, setPartnerLocation] = useState<string | null>(null);
+  const [shareRegion, setShareRegion] = useState(false);
+  const [allowHandleSearch, setAllowHandleSearch] = useState(false);
+  const [blockedHandles, setBlockedHandles] = useState<string[]>([]);
+  const [isDirectChat, setIsDirectChat] = useState(false);
+  const [showPrivacySettingsModal, setShowPrivacySettingsModal] = useState(false);
   const [partnerStyle, setPartnerStyle] = useState<ConversationStyle>("text");
   const [common, setCommon] = useState<string[]>(["Music"]);
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -218,18 +237,19 @@ export default function Home() {
   // Supabase User & Data state (Real only, NO dummy data)
   const [userId, setUserId] = useState<string | null>(null);
   const [friendsList, setFriendsList] = useState<FriendItem[]>([]);
+  const [savedConversations, setSavedConversations] = useState<DirectConversationItem[]>([]);
   const [historyList, setHistoryList] = useState<MatchHistoryItem[]>([]);
 
-  // Total unread notifications across all conversations
-  const totalUnread = historyList.reduce((acc, h) => acc + (h.unread_count || 0), 0);
+  // Total unread notifications across all permanent direct conversations
+  const totalUnread = savedConversations.reduce((acc, h) => acc + (h.unread_count || 0), 0);
 
   // Synchronize App Badge and Document Title
   useEffect(() => {
     if (typeof document !== "undefined") {
       if (totalUnread > 0) {
-        document.title = `(${totalUnread}) Quiet Signal - Encrypted Chat`;
+        document.title = `(${totalUnread}) Dusk — Talk after dark`;
       } else {
-        document.title = "Quiet Signal - Encrypted Stranger Chat";
+        document.title = "Dusk — Talk after dark";
       }
     }
     if (typeof navigator !== "undefined" && "setAppBadge" in navigator) {
@@ -241,7 +261,7 @@ export default function Home() {
     }
   }, [totalUnread]);
 
-  const [historyTab, setHistoryTab] = useState<"chats" | "friends">("chats");
+  const [historyTab, setHistoryTab] = useState<"saved" | "matches" | "friends">("saved");
   const [showReviewRequestsModal, setShowReviewRequestsModal] = useState(false);
   const [showSafetyModal, setShowSafetyModal] = useState(false);
   const [showReportModal, setShowReportModal] = useState(false);
@@ -269,6 +289,7 @@ export default function Home() {
   const [searchResults, setSearchResults] = useState<{ id: string; handle: string; isMember: boolean }[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [incomingDirectInvite, setIncomingDirectInvite] = useState<{
+    inviteId?: string;
     fromSocketId: string;
     fromNick: string;
     fromHandle: string | null;
@@ -316,15 +337,35 @@ export default function Home() {
       requestNotificationPermission();
     }
 
+    // Restore 18+ terms acceptance if previously confirmed by member
+    const savedTerms = typeof window !== "undefined" ? localStorage.getItem("dusk_terms_confirmed_v1") : null;
+    if (savedTerms) {
+      setIsAgeConfirmed(true);
+    }
+
+    // Restore privacy preferences
+    const savedRegionPref = typeof window !== "undefined" ? localStorage.getItem("dusk_share_region") === "true" : false;
+    setShareRegion(savedRegionPref);
+
+    const savedSearchPref = typeof window !== "undefined" ? localStorage.getItem("dusk_allow_search") === "true" : false;
+    setAllowHandleSearch(savedSearchPref);
+
+    try {
+      const savedBlocks = typeof window !== "undefined" ? localStorage.getItem("dusk_blocked_handles") : null;
+      if (savedBlocks) setBlockedHandles(JSON.parse(savedBlocks));
+    } catch {}
+
     const stored = getStoredMember();
     if (stored) {
       setCurrentMember(stored);
       if (stored.handle) {
         setNick(stored.handle);
+        fetchSavedConversations(stored.handle).then(setSavedConversations);
       }
       setUserId(stored.id);
+      setMobileStep(2); // Skip Step 1 for signed-in members
       fetchFriends(stored.id, stored.handle).then(setFriendsList);
-      fetchMatchHistory(stored.id, stored.handle).then(setHistoryList);
+      fetchMatchHistory(stored.id).then(setHistoryList);
     } else {
       fetchFriends(null).then(setFriendsList);
       fetchMatchHistory(null).then(setHistoryList);
@@ -344,23 +385,28 @@ export default function Home() {
           setCurrentMember(member);
           setNick(member.handle);
           setUserId(member.id);
+          setMobileStep(2); // Skip Step 1 for signed-in members
+          fetchSavedConversations(member.handle).then(setSavedConversations);
           fetchFriends(member.id, member.handle).then(setFriendsList);
-          fetchMatchHistory(member.id, member.handle).then(setHistoryList);
-          setShowToast(`Welcome back, @${member.handle}!`);
+          fetchMatchHistory(member.id).then(setHistoryList);
+          setShowToast(`Welcome to Dusk, @${member.handle}! 🌙`);
           setTimeout(() => setShowToast(null), 3000);
 
           // If coming from active OAuth login redirect, immediately enter searching screen!
           if (isOAuthRedirect) {
             find(member.handle, member);
           }
-        } else if (needsHandle && user) {
-          // User authenticated with Google, but needs to claim their handle
-          const seed = (user.user_metadata?.full_name || user.email?.split("@")[0] || "member")
-            .toLowerCase()
-            .replace(/[^a-z0-9]/g, "");
-          openClaimHandleModal(seed);
-          setShowToast("Google connected! Please choose your permanent handle to start matching.");
-          setTimeout(() => setShowToast(null), 4000);
+        } else if (needsHandle && user && isOAuthRedirect) {
+          const alreadyDismissed = typeof window !== "undefined" && sessionStorage.getItem("dusk_claim_dismissed") === "true";
+          if (!alreadyDismissed) {
+            // User just authenticated with OAuth and needs a handle
+            const seed = (user.user_metadata?.full_name || user.email?.split("@")[0] || "member")
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "");
+            openClaimHandleModal(seed);
+            setShowToast("Connected! Please choose your permanent handle to start matching.");
+            setTimeout(() => setShowToast(null), 4000);
+          }
         }
       });
 
@@ -371,19 +417,14 @@ export default function Home() {
             setCurrentMember(res.member);
             setNick(res.member.handle);
             setUserId(res.member.id);
+            setMobileStep(2);
             setShowToast(`Signed in as @${res.member.handle}`);
             setTimeout(() => setShowToast(null), 3000);
-          } else if (res.needsHandle) {
-            const seed = (session.user.user_metadata?.full_name || session.user.email?.split("@")[0] || "member")
-              .toLowerCase()
-              .replace(/[^a-z0-9]/g, "");
-            openClaimHandleModal(seed);
-            setShowToast("Google connected! Please choose your permanent handle.");
-            setTimeout(() => setShowToast(null), 4000);
           }
         } else if (event === "SIGNED_OUT") {
           setCurrentMember(null);
           setNick("Clover");
+          setMobileStep(1);
         }
       });
 
@@ -593,6 +634,8 @@ export default function Home() {
         isInitiator?: boolean;
         isMember?: boolean;
         handle?: string | null;
+        isDirect?: boolean;
+        region?: string | null;
       }) => {
         cleanupMediaAndPeer();
         setPartner(d.nick || "River");
@@ -600,15 +643,16 @@ export default function Home() {
         setPartnerStyle(d.style || "text");
         setPartnerIsMember(!!d.isMember);
         setPartnerHandle(d.handle || null);
+        setIsDirectChat(!!d.isDirect);
         setFriendStatus("none");
         setCommon(d.common && d.common.length > 0 ? d.common : selectedTopics.slice(0, 1));
         setMsgs([]);
         setPhase("chat");
 
-        // Load stored conversation history if chatting with a registered member or friend
+        // Load stored conversation history ONLY if this is a direct connection with a friend/member
         const activeMyHandle = currentMemberRef.current?.handle;
         const targetHandle = d.handle || (d.nick && d.nick !== "Stranger" ? d.nick : null);
-        if (activeMyHandle && targetHandle) {
+        if (d.isDirect && activeMyHandle && targetHandle) {
           fetchDirectChatHistory(activeMyHandle, targetHandle).then((history) => {
             if (history && history.length > 0) {
               setMsgs(history);
@@ -621,14 +665,13 @@ export default function Home() {
           });
         }
 
-        // Broad stable region locked per match
-        const chosenRegion = BROAD_REGIONS[Math.floor(Math.random() * BROAD_REGIONS.length)];
-        setPartnerLocation(chosenRegion);
+        // Broad stable region only if partner opted in
+        setPartnerLocation(d.region || null);
 
-        // Record to real history
+        // Record to real history (ephemeral: metadata only, no messages)
         const savedId = typeof window !== "undefined" ? localStorage.getItem("neonchat_user_id") : null;
         recordMatchHistory(savedId, d.nick || "River", d.gender || "female", d.common || [], false, d.handle || undefined, !!d.isMember);
-        fetchMatchHistory(savedId, activeMyHandle).then(setHistoryList);
+        fetchMatchHistory(savedId).then(setHistoryList);
       }
     );
 
@@ -649,6 +692,14 @@ export default function Home() {
       const activeMyHandle = currentMemberRef.current?.handle;
       const currentActivePartnerHandle = partnerHandleRef.current;
       const currentActivePartnerName = partnerRef.current;
+
+      // Acknowledge delivery receipt immediately
+      if (msgId) {
+        s.emit("message-ack", {
+          messageId: msgId,
+          fromHandle: fromHandle || currentActivePartnerHandle,
+        });
+      }
 
       // Determine if message is for the currently open conversation
       const isDirectForOther = fromHandle && currentActivePartnerHandle && 
@@ -679,9 +730,9 @@ export default function Home() {
         }
       }
 
-      // Persist to direct_messages if sender or receiver is known
-      const targetPartner = fromHandle || currentActivePartnerHandle || currentActivePartnerName;
-      if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+      // Persist to direct_messages ONLY if this is a direct/friend conversation (never for ephemeral stranger chats!)
+      const targetPartner = fromHandle || currentActivePartnerHandle;
+      if (activeMyHandle && targetPartner && targetPartner !== "Stranger" && (isDirectForOther || isDirectChat)) {
         saveDirectMessage({
           id: msgId,
           senderHandle: targetPartner,
@@ -691,9 +742,8 @@ export default function Home() {
           mediaUrl,
           status: !isDirectForOther ? "read" : "delivered",
         });
-        // Auto-refresh match history and friends list to update sorting and badge counts instantly
+        fetchSavedConversations(activeMyHandle).then(setSavedConversations);
         const savedId = currentMemberRef.current?.id || null;
-        fetchMatchHistory(savedId, activeMyHandle).then(setHistoryList);
         fetchFriends(savedId, activeMyHandle).then(setFriendsList);
       }
 
@@ -706,7 +756,7 @@ export default function Home() {
         playNotificationChime();
         sendAppNotification(`@${fromHandle}`, { body: preview, tag: `chat-${fromHandle}` });
       } else if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
-        sendAppNotification(fromHandle ? `@${fromHandle}` : "Quiet Signal", {
+        sendAppNotification(fromHandle ? `@${fromHandle}` : "Dusk", {
           body: preview,
           tag: "chat-msg",
         });
@@ -760,7 +810,7 @@ export default function Home() {
 
     s.on("call-request", () => {
       setIncomingCallRequest(true);
-      sendAppNotification("Quiet Signal - Video Call", {
+      sendAppNotification("Dusk - Video Call", {
         body: "Your chat partner requested a video call!",
         tag: "video-request",
         requireInteraction: true,
@@ -859,13 +909,14 @@ export default function Home() {
     });
 
     s.on("direct-chat-invite", (invite: {
+      inviteId?: string;
       fromSocketId: string;
       fromNick: string;
       fromHandle: string | null;
       fromIsMember: boolean;
     }) => {
       setIncomingDirectInvite(invite);
-      sendAppNotification("Quiet Signal - Direct Chat", {
+      sendAppNotification("Dusk - Direct Chat", {
         body: `${invite.fromHandle ? `@${invite.fromHandle}` : invite.fromNick} wants to chat with you!`,
         tag: "direct-invite",
         requireInteraction: true,
@@ -890,13 +941,21 @@ export default function Home() {
   // Register identity with server whenever member or nickname updates
   useEffect(() => {
     if (socketRef.current) {
-      socketRef.current.emit("register-identity", {
-        handle: currentMember?.handle || nick,
-        nick,
-        isMember: !!currentMember?.isMember,
-      });
+      const activeHandle = currentMember?.handle || nick;
+      if (activeHandle) {
+        supabase?.auth.getSession().then(({ data }) => {
+          socketRef.current?.emit("register-identity", {
+            handle: activeHandle,
+            nick,
+            isMember: !!currentMember?.isMember,
+            allowSearch: allowHandleSearch,
+            blockedHandles,
+            token: data?.session?.access_token || undefined,
+          });
+        });
+      }
     }
-  }, [currentMember, nick]);
+  }, [currentMember, nick, allowHandleSearch, blockedHandles]);
 
   // Instant real-time message sync via Supabase Realtime channel (ensures zero-refresh sync)
   useEffect(() => {
@@ -955,6 +1014,7 @@ export default function Home() {
   const respondDirectChat = (accepted: boolean) => {
     if (!incomingDirectInvite) return;
     socketRef.current?.emit("direct-chat-response", {
+      inviteId: incomingDirectInvite.inviteId,
       accepted,
       fromSocketId: incomingDirectInvite.fromSocketId,
       targetInfo: {
@@ -969,6 +1029,7 @@ export default function Home() {
   const startDirectChat = (targetHandle: string) => {
     if (!targetHandle) return;
     const clean = targetHandle.trim().replace(/^@/, "");
+    setIsDirectChat(true);
     socketRef.current?.emit("direct-chat-request", {
       targetHandle: clean,
       senderInfo: {
@@ -994,6 +1055,46 @@ export default function Home() {
     setFriendsList(updated);
     setShowToast(`@${clean} added to your Friends! 💜`);
     setTimeout(() => setShowToast(null), 3500);
+  };
+
+  const blockHandle = (targetHandle: string) => {
+    const clean = targetHandle.toLowerCase().trim().replace(/^@/, "");
+    if (!clean) return;
+    setBlockedHandles((prev) => {
+      if (prev.includes(clean)) return prev;
+      const nextList = [...prev, clean];
+      localStorage.setItem("dusk_blocked_handles", JSON.stringify(nextList));
+      return nextList;
+    });
+    setShowToast(`@${clean} has been blocked.`);
+    setTimeout(() => setShowToast(null), 3000);
+  };
+
+  const unblockHandle = (targetHandle: string) => {
+    const clean = targetHandle.toLowerCase().trim().replace(/^@/, "");
+    setBlockedHandles((prev) => {
+      const nextList = prev.filter((h) => h !== clean);
+      localStorage.setItem("dusk_blocked_handles", JSON.stringify(nextList));
+      return nextList;
+    });
+    setShowToast(`@${clean} has been unblocked.`);
+    setTimeout(() => setShowToast(null), 3000);
+  };
+
+  const toggleShareRegion = () => {
+    setShareRegion((prev) => {
+      const nextVal = !prev;
+      localStorage.setItem("dusk_share_region", String(nextVal));
+      return nextVal;
+    });
+  };
+
+  const toggleAllowHandleSearch = () => {
+    setAllowHandleSearch((prev) => {
+      const nextVal = !prev;
+      localStorage.setItem("dusk_allow_search", String(nextVal));
+      return nextVal;
+    });
   };
 
   const searchUsersByHandle = async (q: string) => {
@@ -1112,6 +1213,9 @@ export default function Home() {
     );
     if (uid) setUserId(uid);
 
+    setIsDirectChat(false);
+    const chosenRegion = shareRegion ? BROAD_REGIONS[Math.floor(Math.random() * BROAD_REGIONS.length)] : null;
+
     socketRef.current?.emit("find", {
       nick: activeNick,
       gender,
@@ -1119,6 +1223,7 @@ export default function Home() {
       style: conversationStyle,
       isMember: !!activeMember?.isMember,
       handle: activeMember?.handle || null,
+      region: chosenRegion,
     });
   };
 
@@ -1186,8 +1291,8 @@ export default function Home() {
     setMsgs((m) => [...m, payload]);
     if (!overrideText) setDraft("");
 
-    // Persist chat message for logged-in members
-    if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+    // Persist chat message for direct friend conversations (stranger chats stay ephemeral)
+    if (isDirectChat && activeMyHandle && targetPartner && targetPartner !== "Stranger") {
       saveDirectMessage({
         id: msgId,
         senderHandle: activeMyHandle,
@@ -1197,7 +1302,7 @@ export default function Home() {
         text,
         status: "sent",
       });
-      fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
+      fetchSavedConversations(activeMyHandle).then(setSavedConversations);
     }
   };
 
@@ -1237,7 +1342,7 @@ export default function Home() {
     setMsgs((m) => [...m, payload]);
     setShowStickerPicker(false);
 
-    if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+    if (isDirectChat && activeMyHandle && targetPartner && targetPartner !== "Stranger") {
       saveDirectMessage({
         id: msgId,
         senderHandle: activeMyHandle,
@@ -1248,7 +1353,7 @@ export default function Home() {
         mediaUrl: label,
         status: "sent",
       });
-      fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
+      fetchSavedConversations(activeMyHandle).then(setSavedConversations);
     }
   };
 
@@ -1313,8 +1418,8 @@ export default function Home() {
         setShowToast("Photo sent!");
         setTimeout(() => setShowToast(null), 2000);
 
-        // Persist photo message for logged-in members
-        if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+        // Persist photo message for direct friend conversations (stranger chats stay ephemeral)
+        if (isDirectChat && activeMyHandle && targetPartner && targetPartner !== "Stranger") {
           saveDirectMessage({
             id: msgId,
             senderHandle: activeMyHandle,
@@ -1325,7 +1430,7 @@ export default function Home() {
             mediaUrl: compressedBase64,
             status: "sent",
           });
-          fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
+          fetchSavedConversations(activeMyHandle).then(setSavedConversations);
         }
       };
       img.src = event.target?.result as string;
@@ -1400,8 +1505,8 @@ export default function Home() {
         setShowToast("Voice message sent!");
         setTimeout(() => setShowToast(null), 2000);
 
-        // Persist voice note for logged-in members
-        if (activeMyHandle && targetPartner && targetPartner !== "Stranger") {
+        // Persist voice note for direct friend conversations (stranger chats stay ephemeral)
+        if (isDirectChat && activeMyHandle && targetPartner && targetPartner !== "Stranger") {
           saveDirectMessage({
             id: msgId,
             senderHandle: activeMyHandle,
@@ -1412,7 +1517,7 @@ export default function Home() {
             mediaUrl: base64Audio,
             status: "sent",
           });
-          fetchMatchHistory(currentMember?.id || null, activeMyHandle).then(setHistoryList);
+          fetchSavedConversations(activeMyHandle).then(setSavedConversations);
         }
       };
       reader.readAsDataURL(blob);
@@ -2067,7 +2172,7 @@ export default function Home() {
               {legalModal === "terms" && (
                 <>
                   <p className="font-semibold text-slate-900 dark:text-white">Terms of use summary.</p>
-                  <p>By using Quiet Signal, you confirm you are 18+, agree to maintain respectful conduct, and understand sessions can be ended at any moment by either party.</p>
+                  <p>By using Dusk, you confirm you are 18+, agree to maintain respectful conduct, and understand sessions can be ended at any moment by either party.</p>
                 </>
               )}
             </div>
@@ -2138,7 +2243,7 @@ export default function Home() {
                 </div>
                 <div>
                   <h3 className="text-base font-bold text-slate-900 dark:text-white leading-tight">
-                    {authModalTab === "claim" ? "Claim Your Permanent Handle" : "Sign In to Quiet Signal"}
+                    {authModalTab === "claim" ? "Claim Your Permanent Handle" : "Sign In to Dusk"}
                   </h3>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400">
                     {authModalTab === "claim"
@@ -2152,6 +2257,9 @@ export default function Home() {
                   setShowAuthModal(false);
                   setAuthError(null);
                   setAuthSuccessMessage(null);
+                  if (typeof window !== "undefined") {
+                    sessionStorage.setItem("dusk_claim_dismissed", "true");
+                  }
                 }}
                 className="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 flex items-center justify-center text-xs cursor-pointer"
               >
@@ -2376,6 +2484,9 @@ export default function Home() {
                 type="button"
                 onClick={() => {
                   setShowAuthModal(false);
+                  if (typeof window !== "undefined") {
+                    sessionStorage.setItem("dusk_claim_dismissed", "true");
+                  }
                 }}
                 className="text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 transition-colors py-1 cursor-pointer"
               >
@@ -2391,38 +2502,93 @@ export default function Home() {
       ======================================================== */}
       {phase === "setup" && (
         <div className="flex-1 flex flex-col h-full overflow-y-auto bg-white dark:bg-[#0b0f19]">
-          <header className="px-6 md:px-10 py-4 flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 sticky top-0 bg-white/90 dark:bg-[#0b0f19]/90 backdrop-blur-md z-20">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs overflow-hidden">
-                <img src="/icons/icon-192.png" alt="Quiet Signal" className="w-full h-full object-cover" />
+          <header className="px-4 sm:px-8 py-3.5 flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 sticky top-0 bg-white/95 dark:bg-[#0b0f19]/95 backdrop-blur-md z-30">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-xl bg-[#1b1a40] flex items-center justify-center text-white shadow-2xs overflow-hidden shrink-0 border border-indigo-500/30">
+                <img src="/icons/icon-192.png" alt="Dusk" className="w-full h-full object-cover" />
               </div>
-              <div>
-                <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Quiet Signal</h1>
-                <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-tight hidden sm:block">
-                  Anonymous conversations, on your terms
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <h1 className="text-base font-black text-slate-900 dark:text-white leading-none tracking-tight">Dusk</h1>
+                  <span className="text-[10px] text-amber-400">🌙</span>
+                </div>
+                <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-none mt-1 hidden sm:block truncate">
+                  Talk after dark
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
-              <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800">
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
                 <span>{onlineCount.toLocaleString()} online</span>
               </span>
 
+              {/* Friends & Chats Button with Unread Badge */}
+              <button
+                type="button"
+                onClick={() => setPhase("history")}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold transition-colors cursor-pointer min-h-[36px] relative"
+                title="View Friends and Chat History"
+              >
+                <span>👥</span>
+                <span className="hidden sm:inline">Chats</span>
+                {totalUnread > 0 ? (
+                  <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold animate-pulse">
+                    {totalUnread}
+                  </span>
+                ) : friendsList.length > 0 ? (
+                  <span className="px-1.5 py-0.2 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-[10px] font-bold">
+                    {friendsList.length}
+                  </span>
+                ) : null}
+              </button>
+
+              {/* Account / Auth Button or Compact Avatar Dropdown */}
               {currentMember ? (
-                <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200/80 dark:border-indigo-800/80 text-xs">
-                  <div className="flex items-center gap-1.5">
-                    <span className="font-bold text-[#5b4df2] dark:text-indigo-400">@{currentMember.handle}</span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#5b4df2] text-white font-semibold">Member</span>
-                  </div>
+                <div className="relative">
                   <button
-                    onClick={handleLogout}
-                    className="ml-1 pl-1.5 border-l border-indigo-200 dark:border-indigo-800 text-[11px] font-semibold text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 cursor-pointer transition-colors"
-                    title="Sign out of account"
+                    type="button"
+                    onClick={() => setAccountMenuOpen((v) => !v)}
+                    className="flex items-center gap-1.5 p-1 sm:px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer text-xs min-h-[36px]"
+                    title={`Account: @${currentMember.handle}`}
                   >
-                    Sign out
+                    {renderAvatar(currentMember.handle, "w-6 h-6 text-[10px]")}
+                    <span className="font-bold text-slate-900 dark:text-white truncate max-w-[80px] sm:max-w-[110px] hidden xs:inline">
+                      @{currentMember.handle}
+                    </span>
+                    <span className="text-[10px] text-slate-400">▾</span>
                   </button>
+
+                  {accountMenuOpen && (
+                    <div className="absolute right-0 top-full mt-2 w-48 bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xl p-2 z-50 space-y-1 animate-in fade-in zoom-in-95">
+                      <div className="px-2.5 py-2 border-b border-slate-100 dark:border-slate-800">
+                        <p className="text-xs font-bold text-slate-900 dark:text-white truncate">@{currentMember.handle}</p>
+                        <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-indigo-50 dark:bg-indigo-950 text-[#5b4df2] font-semibold">Verified Member</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => { setAccountMenuOpen(false); openClaimHandleModal(currentMember.handle); }}
+                        className="w-full text-left px-2.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-xl transition-colors cursor-pointer"
+                      >
+                        Change Handle
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setAccountMenuOpen(false); setPhase("history"); }}
+                        className="w-full text-left px-2.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-xl transition-colors cursor-pointer"
+                      >
+                        Privacy & Discovery
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setAccountMenuOpen(false); handleLogout(); }}
+                        className="w-full text-left px-2.5 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-xl transition-colors cursor-pointer"
+                      >
+                        Sign Out
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <button
@@ -2439,28 +2605,9 @@ export default function Home() {
 
               <button
                 type="button"
-                onClick={() => setPhase("history")}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold transition-colors cursor-pointer min-h-[36px] relative"
-                title="View Friends and Chat History"
-              >
-                <span>👥</span>
-                <span className="hidden sm:inline">Friends & Chats</span>
-                {totalUnread > 0 ? (
-                  <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold animate-pulse">
-                    {totalUnread}
-                  </span>
-                ) : friendsList.length > 0 ? (
-                  <span className="px-1.5 py-0.2 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-[10px] font-bold">
-                    {friendsList.length}
-                  </span>
-                ) : null}
-              </button>
-
-              <button
-                type="button"
                 onClick={toggleTheme}
                 aria-label={isDarkMode ? "Switch to light mode" : "Switch to dark mode"}
-                className="w-9 h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                className="w-8 h-8 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
                 title={isDarkMode ? "Light mode" : "Dark mode"}
               >
                 {isDarkMode ? "☀️" : "🌙"}
@@ -2521,34 +2668,34 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Trust and Safety Commitments */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs text-slate-700 dark:text-slate-300 font-medium pt-1">
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60">
-                    <svg className="w-4 h-4 text-[#5b4df2] shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                {/* Trust and Safety Commitments (Compact 2x2 Grid) */}
+                <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-700 dark:text-slate-300 font-medium pt-1">
+                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                    <svg className="w-3.5 h-3.5 text-[#5b4df2] shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
                     </svg>
-                    <span>Anonymous by default</span>
+                    <span className="truncate">Anonymous by default</span>
                   </div>
 
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60">
-                    <svg className="w-4 h-4 text-emerald-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                    <svg className="w-3.5 h-3.5 text-emerald-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
                     </svg>
-                    <span>Leave anytime (1-click)</span>
+                    <span className="truncate">Leave anytime</span>
                   </div>
 
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60">
-                    <svg className="w-4 h-4 text-amber-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                    <svg className="w-3.5 h-3.5 text-amber-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M3 21v-4m0 0V5a2 2 0 012-2h6.5l1 1H21l-3 6 3 6h-8.5l-1-1H5a2 2 0 00-2 2zm9-13.5V9" />
                     </svg>
-                    <span>Instant report & block</span>
+                    <span className="truncate">Report & block</span>
                   </div>
 
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60">
-                    <svg className="w-4 h-4 text-indigo-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                    <svg className="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                     </svg>
-                    <span>Temporary session memory</span>
+                    <span className="truncate">Session memory</span>
                   </div>
                 </div>
               </div>
@@ -2578,104 +2725,110 @@ export default function Home() {
                   {/* Mobile Stepper Indicator */}
                   <div className="block md:hidden pb-1">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">
-                      <span>Step {mobileStep} of 3: {mobileStep === 1 ? "Identity" : mobileStep === 2 ? "Topics" : "Style"}</span>
-                      <span className="text-[11px] text-[#5b4df2]">{Math.round((mobileStep / 3) * 100)}%</span>
+                      <span>
+                        {currentMember
+                          ? `Step ${mobileStep === 2 ? 1 : 2} of 2: ${mobileStep === 2 ? "Topics" : "Style"}`
+                          : `Step ${mobileStep} of 3: ${mobileStep === 1 ? "Identity" : mobileStep === 2 ? "Topics" : "Style"}`}
+                      </span>
+                      <span className="text-[11px] text-[#5b4df2]">
+                        {currentMember
+                          ? `${Math.round(((mobileStep === 2 ? 1 : 2) / 2) * 100)}%`
+                          : `${Math.round((mobileStep / 3) * 100)}%`}
+                      </span>
                     </div>
                     <div className="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
                       <div
                         className="bg-[#5b4df2] h-full transition-all duration-300"
-                        style={{ width: `${(mobileStep / 3) * 100}%` }}
+                        style={{
+                          width: currentMember
+                            ? `${((mobileStep === 2 ? 1 : 2) / 2) * 100}%`
+                            : `${(mobileStep / 3) * 100}%`,
+                        }}
                       />
                     </div>
                   </div>
 
-                  {/* Step 1: Nickname */}
+                  {/* Step 1: Nickname (or Read-only Member Identity chip) */}
                   <div className={`space-y-2 ${mobileStep !== 1 ? "hidden md:block" : ""}`}>
-                    <div className="flex items-center justify-between">
-                      <label htmlFor="nickname-input" className="text-xs font-semibold text-slate-800 dark:text-slate-200 block">
-                        How should we call you?
-                      </label>
-                      <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                        {currentMember ? "Permanent Handle" : "Not your real name"}
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <div className="relative flex-1">
-                        <input
-                          id="nickname-input"
-                          type="text"
-                          className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/80 text-base text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-[#5b4df2] focus:bg-white dark:focus:bg-slate-800 transition-all min-h-[44px]"
-                          placeholder="e.g. Clover"
-                          value={nick}
-                          maxLength={20}
-                          onChange={(e) => handleGuestNickChange(e.target.value)}
-                        />
-                        {currentMember && (
-                          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-[#5b4df2] flex items-center gap-1 bg-indigo-50 dark:bg-indigo-950 px-2 py-0.5 rounded-md">
-                            <span>🔒</span>
-                            <span>Member</span>
-                          </span>
-                        )}
-                      </div>
-
-                      {!currentMember && (
-                        <button
-                          type="button"
-                          onClick={shuffleNickname}
-                          className="px-3.5 py-3 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer min-h-[44px]"
-                          title="Shuffle anonymous name"
-                          aria-label="Shuffle anonymous name"
-                        >
-                          <span>🎲</span>
-                          <span className="hidden sm:inline">Shuffle</span>
-                        </button>
-                      )}
-                    </div>
-
-                    {guestNickWarning && (
-                      <p className="text-xs text-rose-500 font-semibold flex items-center gap-1.5 pt-0.5">
-                        <span>⚠️</span>
-                        <span>{guestNickWarning}</span>
-                      </p>
-                    )}
-
-                    {/* Handle Reservation / Account Status Link */}
                     {currentMember ? (
-                      <div className="flex items-center justify-between text-[11px] text-indigo-700 dark:text-indigo-300 font-medium bg-indigo-50/80 dark:bg-indigo-950/40 px-3 py-2 rounded-xl border border-indigo-100 dark:border-indigo-900/50">
-                        <span className="flex items-center gap-1.5">
-                          <span>✓</span>
-                          <span>Reserved as <strong>@{currentMember.handle}</strong></span>
-                        </span>
-                        <div className="flex items-center gap-2">
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-semibold text-slate-800 dark:text-slate-200 block">
+                          Connected Identity
+                        </label>
+                        <div className="flex items-center justify-between p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/80 border border-slate-200/80 dark:border-slate-700">
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            {renderAvatar(currentMember.handle, "w-8 h-8 text-xs")}
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-bold text-slate-900 dark:text-white truncate">@{currentMember.handle}</span>
+                                <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-indigo-50 dark:bg-indigo-950 text-[#5b4df2] font-semibold">Member</span>
+                              </div>
+                              <p className="text-[10px] text-slate-400 truncate">Verified handle</p>
+                            </div>
+                          </div>
                           <button
                             type="button"
                             onClick={() => openClaimHandleModal(currentMember.handle)}
-                            className="hover:underline font-semibold text-[#5b4df2] dark:text-indigo-400 cursor-pointer"
+                            className="text-xs font-semibold text-[#5b4df2] dark:text-indigo-400 hover:underline px-2.5 py-1 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-950/50 cursor-pointer"
                           >
                             Change
-                          </button>
-                          <span className="text-slate-300 dark:text-slate-700">•</span>
-                          <button
-                            type="button"
-                            onClick={handleLogout}
-                            className="hover:underline text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 font-semibold cursor-pointer"
-                          >
-                            Log out
                           </button>
                         </div>
                       </div>
                     ) : (
-                      <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
-                        <span>Visible only to your match during chat.</span>
-                        <button
-                          type="button"
-                          onClick={() => openClaimHandleModal(nick)}
-                          className="text-[#5b4df2] hover:underline font-semibold cursor-pointer"
-                        >
-                          Keep this name? Sign in
-                        </button>
-                      </div>
+                      <>
+                        <div className="flex items-center justify-between">
+                          <label htmlFor="nickname-input" className="text-xs font-semibold text-slate-800 dark:text-slate-200 block">
+                            How should we call you?
+                          </label>
+                          <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Not your real name
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <div className="relative flex-1">
+                            <input
+                              id="nickname-input"
+                              type="text"
+                              className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/80 text-base text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-[#5b4df2] focus:bg-white dark:focus:bg-slate-800 transition-all min-h-[44px]"
+                              placeholder="e.g. Clover"
+                              value={nick}
+                              maxLength={20}
+                              onChange={(e) => handleGuestNickChange(e.target.value)}
+                            />
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={shuffleNickname}
+                            className="px-3.5 py-3 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer min-h-[44px]"
+                            title="Shuffle anonymous name"
+                            aria-label="Shuffle anonymous name"
+                          >
+                            <span>🎲</span>
+                            <span className="hidden sm:inline">Shuffle</span>
+                          </button>
+                        </div>
+
+                        {guestNickWarning && (
+                          <p className="text-xs text-rose-500 font-semibold flex items-center gap-1.5 pt-0.5">
+                            <span>⚠️</span>
+                            <span>{guestNickWarning}</span>
+                          </p>
+                        )}
+
+                        <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                          <span>Visible only to your match during chat.</span>
+                          <button
+                            type="button"
+                            onClick={() => openClaimHandleModal(nick)}
+                            className="text-[#5b4df2] hover:underline font-semibold cursor-pointer"
+                          >
+                            Keep this name? Sign in
+                          </button>
+                        </div>
+                      </>
                     )}
 
                     <div className="block md:hidden pt-2">
@@ -2766,13 +2919,15 @@ export default function Home() {
                     </div>
 
                     <div className="flex md:hidden items-center gap-2 pt-2">
-                      <button
-                        type="button"
-                        onClick={() => setMobileStep(1)}
-                        className="py-3 px-4 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold text-xs min-h-[44px]"
-                      >
-                        ← Back
-                      </button>
+                      {!currentMember && (
+                        <button
+                          type="button"
+                          onClick={() => setMobileStep(1)}
+                          className="py-3 px-4 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold text-xs min-h-[44px]"
+                        >
+                          ← Back
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => setMobileStep(3)}
@@ -2849,7 +3004,17 @@ export default function Home() {
                       <input
                         type="checkbox"
                         checked={isAgeConfirmed}
-                        onChange={(e) => setIsAgeConfirmed(e.target.checked)}
+                        onChange={(e) => {
+                          const val = e.target.checked;
+                          setIsAgeConfirmed(val);
+                          if (typeof window !== "undefined") {
+                            if (val) {
+                              localStorage.setItem("dusk_terms_confirmed_v1", new Date().toISOString());
+                            } else {
+                              localStorage.removeItem("dusk_terms_confirmed_v1");
+                            }
+                          }
+                        }}
                         className="w-4 h-4 rounded text-[#5b4df2] accent-[#5b4df2] cursor-pointer shrink-0"
                       />
                       <span>I confirm I am <strong>18+</strong> and agree to the Community Guidelines.</span>
@@ -2916,9 +3081,9 @@ export default function Home() {
 
             <footer className="mt-12 pt-6 border-t border-slate-200/80 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 flex flex-col sm:flex-row items-center justify-between gap-4">
               <div className="flex items-center gap-2">
-                <span>© 2026 Quiet Signal</span>
+                <span>© 2026 Dusk</span>
                 <span>·</span>
-                <span>WebRTC encrypted stranger chat</span>
+                <span>Talk after dark</span>
               </div>
 
               <div className="flex items-center gap-6">
@@ -3043,7 +3208,7 @@ export default function Home() {
                 className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs overflow-hidden cursor-pointer"
                 title="Home"
               >
-                <img src="/icons/icon-192.png" alt="Quiet Signal" className="w-full h-full object-cover" />
+                <img src="/icons/icon-192.png" alt="Dusk" className="w-full h-full object-cover" />
               </button>
               <div>
                 <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Your conversations</h1>
@@ -3071,20 +3236,39 @@ export default function Home() {
           </header>
 
           <main className="flex-1 p-4 sm:p-8 max-w-6xl mx-auto w-full">
-            {/* Top Tab Bar: Switch between Conversations and My Friends */}
-            <div className="flex items-center gap-2 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-2xl w-fit mb-6 border border-slate-200/60 dark:border-slate-700/60">
+            {/* Top Tab Bar: Saved Chats, Past Matches, and My Friends */}
+            <div className="flex flex-wrap items-center gap-2 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-2xl w-fit mb-6 border border-slate-200/60 dark:border-slate-700/60">
               <button
                 type="button"
-                onClick={() => setHistoryTab("chats")}
+                onClick={() => setHistoryTab("saved")}
                 className={`px-4 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
-                  historyTab === "chats"
+                  historyTab === "saved"
                     ? "bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-2xs"
                     : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                 }`}
               >
                 <span>💬</span>
-                <span>Recent Chats ({historyList.length})</span>
+                <span>Saved Chats ({savedConversations.length})</span>
+                {totalUnread > 0 && (
+                  <span className="ml-1 px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold animate-pulse">
+                    {totalUnread}
+                  </span>
+                )}
               </button>
+
+              <button
+                type="button"
+                onClick={() => setHistoryTab("matches")}
+                className={`px-4 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  historyTab === "matches"
+                    ? "bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-2xs"
+                    : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                }`}
+              >
+                <span>🌙</span>
+                <span>Past Matches ({historyList.length})</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => setHistoryTab("friends")}
@@ -3095,28 +3279,120 @@ export default function Home() {
                 }`}
               >
                 <span>👥</span>
-                <span>My Friends ({friendsList.length})</span>
+                <span>Friends ({friendsList.length})</span>
               </button>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
               <div className="lg:col-span-8 bg-white dark:bg-slate-900 rounded-3xl border border-slate-200/80 dark:border-slate-800 p-6 shadow-2xs space-y-4">
                 
-                {historyTab === "chats" && (
+                {/* TAB 1: SAVED CHATS (Friends with permanent message history) */}
+                {historyTab === "saved" && (
                   <>
                     <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
-                      <h3 className="text-sm font-bold text-slate-900 dark:text-white">Recent conversations</h3>
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-900 dark:text-white">Saved conversations</h3>
+                        <p className="text-[11px] text-slate-400">Direct messages with friends and connected members</p>
+                      </div>
+                      <span className="text-xs text-slate-400">{savedConversations.length} saved</span>
+                    </div>
+
+                    {savedConversations.length === 0 ? (
+                      <div className="py-12 text-center space-y-2">
+                        <div className="w-12 h-12 mx-auto rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400 text-lg">
+                          💬
+                        </div>
+                        <p className="text-xs font-semibold text-slate-700 dark:text-slate-300">No saved conversations yet</p>
+                        <p className="text-[11px] text-slate-400 max-w-xs mx-auto">
+                          When you add someone as a friend or chat directly, your conversation messages stay saved here.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                        {savedConversations.map((item) => (
+                          <div
+                            key={item.id}
+                            onClick={async () => {
+                              setIsDirectChat(true);
+                              setPartner(item.partner_name);
+                              setPartnerHandle(item.partner_handle);
+                              setPartnerIsMember(true);
+                              setPhase("chat");
+                              if (currentMember?.handle) {
+                                const history = await fetchDirectChatHistory(currentMember.handle, item.partner_handle);
+                                setMsgs(history || []);
+                                markDirectMessagesAsRead(item.partner_handle, currentMember.handle);
+                                socketRef.current?.emit("message-seen", {
+                                  toHandle: item.partner_handle,
+                                  fromHandle: currentMember.handle,
+                                });
+                                fetchSavedConversations(currentMember.handle).then(setSavedConversations);
+                              }
+                            }}
+                            className="py-4 flex items-center justify-between hover:bg-slate-50/80 dark:hover:bg-slate-800/50 -mx-3 px-3 rounded-2xl transition-all cursor-pointer"
+                          >
+                            <div className="flex items-center gap-3.5 min-w-0">
+                              {renderAvatar(item.partner_name, "w-11 h-11")}
+                              <div className="space-y-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-bold text-slate-900 dark:text-white truncate">{item.partner_name}</span>
+                                  <span className="text-[11px] text-slate-400 font-medium truncate">@{item.partner_handle}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5 text-xs truncate max-w-md">
+                                  {item.last_status && (
+                                    <span className="text-[10px] shrink-0 font-medium">
+                                      {item.last_status === "read" ? (
+                                        <span className="text-[#5b4df2] font-bold">✓✓</span>
+                                      ) : item.last_status === "delivered" ? (
+                                        <span className="text-slate-400 font-bold">✓✓</span>
+                                      ) : (
+                                        <span className="text-slate-400">✓</span>
+                                      )}
+                                    </span>
+                                  )}
+                                  <p className={`truncate ${item.unread_count > 0 ? "font-bold text-slate-900 dark:text-white" : "text-slate-500 dark:text-slate-400"}`}>
+                                    {item.last_message || "Direct conversation"}
+                                  </p>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="text-right shrink-0 flex flex-col items-end gap-1.5 ml-3">
+                              <span className="text-[11px] text-slate-400">
+                                {new Date(item.last_message_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                              </span>
+                              {item.unread_count > 0 && (
+                                <span className="px-2 py-0.5 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold shadow-xs animate-pulse">
+                                  {item.unread_count}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* TAB 2: PAST MATCHES (Anonymous stranger sessions - NO message previews) */}
+                {historyTab === "matches" && (
+                  <>
+                    <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-900 dark:text-white">Past stranger matches</h3>
+                        <p className="text-[11px] text-slate-400">Ephemeral stranger sessions · No chat messages stored</p>
+                      </div>
                       <span className="text-xs text-slate-400">{historyList.length} past matches</span>
                     </div>
 
                     {historyList.length === 0 ? (
                       <div className="py-12 text-center space-y-2">
                         <div className="w-12 h-12 mx-auto rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400 text-lg">
-                          💬
+                          🌙
                         </div>
-                        <p className="text-xs font-semibold text-slate-700 dark:text-slate-300">No past conversations yet</p>
+                        <p className="text-xs font-semibold text-slate-700 dark:text-slate-300">No past matches yet</p>
                         <p className="text-[11px] text-slate-400 max-w-xs mx-auto">
-                          Matches and direct chats you start will be recorded here.
+                          People you match with by shared interests appear here. Stranger messages remain completely ephemeral.
                         </p>
                       </div>
                     ) : (
@@ -3124,28 +3400,7 @@ export default function Home() {
                         {historyList.map((item) => (
                           <div
                             key={item.id}
-                            onClick={async () => {
-                              const targetHandle = item.partner_handle || item.partner_name;
-                              setPartner(item.partner_name);
-                              setPartnerHandle(targetHandle);
-                              setPartnerIsMember(!!item.is_member);
-                              setPhase("chat");
-                              if (currentMember?.handle) {
-                                const history = await fetchDirectChatHistory(currentMember.handle, targetHandle);
-                                if (history && history.length > 0) {
-                                  setMsgs(history);
-                                } else {
-                                  setMsgs([]);
-                                }
-                                markDirectMessagesAsRead(targetHandle, currentMember.handle);
-                                socketRef.current?.emit("message-seen", {
-                                  toHandle: targetHandle,
-                                  fromHandle: currentMember.handle,
-                                });
-                                fetchMatchHistory(currentMember.id, currentMember.handle).then(setHistoryList);
-                              }
-                            }}
-                            className="py-4 flex items-center justify-between hover:bg-slate-50/80 dark:hover:bg-slate-800/50 -mx-3 px-3 rounded-2xl transition-all cursor-pointer"
+                            className="py-4 flex items-center justify-between hover:bg-slate-50/80 dark:hover:bg-slate-800/50 -mx-3 px-3 rounded-2xl transition-all"
                           >
                             <div className="flex items-center gap-3.5 min-w-0">
                               {renderAvatar(item.partner_name, "w-11 h-11")}
@@ -3161,21 +3416,25 @@ export default function Home() {
                                     </span>
                                   )}
                                 </div>
-                                <p className={`text-xs truncate max-w-md ${item.unread_count && item.unread_count > 0 ? "font-bold text-slate-900 dark:text-white" : "text-slate-500 dark:text-slate-400"}`}>
-                                  {item.last_message || "Past conversation"}
+                                <p className="text-[11px] text-slate-400 italic">
+                                  Ephemeral stranger session · No messages stored
                                 </p>
                               </div>
                             </div>
 
-                            <div className="text-right shrink-0 flex flex-col items-end gap-1.5 ml-3">
-                              <span className="text-[11px] text-slate-400">
-                                {new Date(item.last_message_at || item.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                            <div className="text-right shrink-0 flex items-center gap-2 ml-3">
+                              <span className="text-[11px] text-slate-400 hidden sm:inline">
+                                {new Date(item.matched_at).toLocaleDateString([], { month: "short", day: "numeric" })}
                               </span>
-                              {item.unread_count && item.unread_count > 0 ? (
-                                <span className="px-2 py-0.5 rounded-full bg-[#5b4df2] text-white text-[10px] font-bold shadow-xs animate-pulse">
-                                  {item.unread_count}
-                                </span>
-                              ) : null}
+                              {item.partner_handle && (
+                                <button
+                                  type="button"
+                                  onClick={() => startDirectChat(item.partner_handle!)}
+                                  className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold transition-colors cursor-pointer"
+                                >
+                                  Invite again
+                                </button>
+                              )}
                             </div>
                           </div>
                         ))}
@@ -3184,6 +3443,7 @@ export default function Home() {
                   </>
                 )}
 
+                {/* TAB 3: MY FRIENDS */}
                 {historyTab === "friends" && (
                   <>
                     <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
@@ -3238,23 +3498,20 @@ export default function Home() {
                                 <button
                                   type="button"
                                   onClick={async () => {
+                                    setIsDirectChat(true);
                                     setPartner(f.friend_name);
                                     setPartnerHandle(targetHandle);
                                     setPartnerIsMember(!!f.is_member);
                                     setPhase("chat");
                                     if (currentMember?.handle) {
                                       const history = await fetchDirectChatHistory(currentMember.handle, targetHandle);
-                                      if (history && history.length > 0) {
-                                        setMsgs(history);
-                                      } else {
-                                        setMsgs([]);
-                                      }
+                                      setMsgs(history || []);
                                       markDirectMessagesAsRead(targetHandle, currentMember.handle);
                                       socketRef.current?.emit("message-seen", {
                                         toHandle: targetHandle,
                                         fromHandle: currentMember.handle,
                                       });
-                                      fetchMatchHistory(currentMember.id, currentMember.handle).then(setHistoryList);
+                                      fetchSavedConversations(currentMember.handle).then(setSavedConversations);
                                     }
                                   }}
                                   className="px-3.5 py-1.5 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] text-white text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shadow-2xs"
@@ -3270,6 +3527,14 @@ export default function Home() {
                                   title={`Send direct chat invite to ${f.friend_name}`}
                                 >
                                   <span>🔔</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => blockHandle(targetHandle)}
+                                  className="p-1.5 rounded-xl hover:bg-rose-50 dark:hover:bg-rose-950/40 text-slate-400 hover:text-rose-600 transition-colors cursor-pointer text-xs"
+                                  title={`Block @${targetHandle}`}
+                                >
+                                  🚫
                                 </button>
                               </div>
                             </div>
@@ -3305,7 +3570,7 @@ export default function Home() {
                   {searchHandleQuery.trim().length >= 2 && (
                     <div className="space-y-1.5 pt-1 max-h-56 overflow-y-auto">
                       {searchResults.length === 0 && !searchLoading ? (
-                        <p className="text-[11px] text-slate-400 py-1">No member found with that handle.</p>
+                        <p className="text-[11px] text-slate-400 py-1">No member found with that handle or user has disabled discovery.</p>
                       ) : (
                         searchResults.map((user) => (
                           <div
@@ -3341,6 +3606,92 @@ export default function Home() {
                       )}
                     </div>
                   )}
+                </div>
+
+                {/* Privacy & Safety Controls Card */}
+                <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200/80 dark:border-slate-800 p-5 shadow-2xs space-y-3.5">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                      <span>🛡️</span>
+                      <span>Privacy & Safety</span>
+                    </h4>
+                  </div>
+
+                  <div className="space-y-3 pt-1 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="font-semibold text-slate-800 dark:text-slate-200">Find me by @handle</p>
+                        <p className="text-[10px] text-slate-400">Let others search and invite you to chat</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={toggleAllowHandleSearch}
+                        className={`w-10 h-6 rounded-full p-0.5 transition-colors cursor-pointer ${
+                          allowHandleSearch ? "bg-[#5b4df2]" : "bg-slate-300 dark:bg-slate-700"
+                        }`}
+                      >
+                        <div
+                          className={`w-5 h-5 rounded-full bg-white transition-transform ${
+                            allowHandleSearch ? "translate-x-4" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                      <div>
+                        <p className="font-semibold text-slate-800 dark:text-slate-200">Share coarse region</p>
+                        <p className="text-[10px] text-slate-400">Show coarse area like &ldquo;Mid-Atlantic&rdquo;</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={toggleShareRegion}
+                        className={`w-10 h-6 rounded-full p-0.5 transition-colors cursor-pointer ${
+                          shareRegion ? "bg-[#5b4df2]" : "bg-slate-300 dark:bg-slate-700"
+                        }`}
+                      >
+                        <div
+                          className={`w-5 h-5 rounded-full bg-white transition-transform ${
+                            shareRegion ? "translate-x-4" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
+                      <div>
+                        <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium block">WebRTC IP Masking</span>
+                        <span className="text-[10px] text-slate-400">Relay mode hides your IP from peers</span>
+                      </div>
+                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400">
+                        Relay Active
+                      </span>
+                    </div>
+
+                    {blockedHandles.length > 0 && (
+                      <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1.5">
+                        <p className="text-[10px] font-semibold text-slate-500">Blocked users ({blockedHandles.length})</p>
+                        <div className="flex flex-wrap gap-1">
+                          {blockedHandles.map((h) => (
+                            <span
+                              key={h}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 text-[10px]"
+                            >
+                              @{h}
+                              <button
+                                type="button"
+                                onClick={() => unblockHandle(h)}
+                                className="hover:font-bold cursor-pointer ml-0.5"
+                                title="Unblock"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200/80 dark:border-slate-800 p-6 shadow-2xs space-y-2">
@@ -3402,7 +3753,7 @@ export default function Home() {
                   </div>
                   <div className="text-center">
                     <h3 className="text-sm font-bold text-white">{partner}</h3>
-                    <p className="text-[11px] text-slate-400">{partnerLocation}</p>
+                    {partnerLocation && <p className="text-[11px] text-slate-400">{partnerLocation}</p>}
                   </div>
                 </div>
               )}
@@ -3576,9 +3927,9 @@ export default function Home() {
                 className="w-8 h-8 rounded-xl bg-[#5b4df2] flex items-center justify-center text-white shadow-2xs overflow-hidden cursor-pointer"
                 title="View conversations"
               >
-                <img src="/icons/icon-192.png" alt="Quiet Signal" className="w-full h-full object-cover" />
+                <img src="/icons/icon-192.png" alt="Dusk" className="w-full h-full object-cover" />
               </button>
-              <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Quiet Signal</h1>
+              <h1 className="text-sm font-bold text-slate-900 dark:text-white leading-tight">Dusk</h1>
             </div>
 
             <div className="flex items-center gap-2.5">
@@ -3655,39 +4006,35 @@ export default function Home() {
                   </div>
 
                   {/* Real past matches only (Empty state if none yet) */}
-                  {historyList.filter(h => h.partner_name !== partner).length === 0 ? (
+                  {savedConversations.filter(h => h.partner_name !== partner).length === 0 ? (
                     <div className="py-8 px-2 text-center space-y-1">
-                      <p className="text-xs font-semibold text-slate-600 dark:text-slate-400">No other past chats</p>
+                      <p className="text-xs font-semibold text-slate-600 dark:text-slate-400">No other saved chats</p>
                       <p className="text-[11px] text-slate-400">
                         Other people you connect with will be listed here.
                       </p>
                     </div>
                   ) : (
-                    historyList
+                    savedConversations
                       .filter(h => h.partner_name !== partner)
                       .slice(0, 5)
                       .map((h) => (
                         <div
                           key={h.id}
                           onClick={async () => {
-                            const targetHandle = h.partner_handle || h.partner_name;
+                            setIsDirectChat(true);
                             setPartner(h.partner_name);
-                            setPartnerHandle(targetHandle);
-                            setPartnerIsMember(!!h.is_member);
+                            setPartnerHandle(h.partner_handle);
+                            setPartnerIsMember(h.is_member);
                             setMobileDrawerOpen(false);
                             if (currentMember?.handle) {
-                              const history = await fetchDirectChatHistory(currentMember.handle, targetHandle);
-                              if (history && history.length > 0) {
-                                setMsgs(history);
-                              } else {
-                                setMsgs([]);
-                              }
-                              markDirectMessagesAsRead(targetHandle, currentMember.handle);
+                              const history = await fetchDirectChatHistory(currentMember.handle, h.partner_handle);
+                              setMsgs(history || []);
+                              markDirectMessagesAsRead(h.partner_handle, currentMember.handle);
                               socketRef.current?.emit("message-seen", {
-                                toHandle: targetHandle,
+                                toHandle: h.partner_handle,
                                 fromHandle: currentMember.handle,
                               });
-                              fetchMatchHistory(currentMember.id, currentMember.handle).then(setHistoryList);
+                              fetchSavedConversations(currentMember.handle).then(setSavedConversations);
                             }
                           }}
                           className="p-3 rounded-2xl hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors flex items-center gap-3 cursor-pointer"
@@ -3698,17 +4045,17 @@ export default function Home() {
                               <span className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate">{h.partner_name}</span>
                               <div className="flex items-center gap-1.5 shrink-0">
                                 <span className="text-[10px] text-slate-400">
-                                  {new Date(h.last_message_at || h.matched_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                  {new Date(h.last_message_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                                 </span>
-                                {h.unread_count && h.unread_count > 0 ? (
+                                {h.unread_count > 0 && (
                                   <span className="px-1.5 py-0.2 rounded-full bg-[#5b4df2] text-white text-[9px] font-bold">
                                     {h.unread_count}
                                   </span>
-                                ) : null}
+                                )}
                               </div>
                             </div>
-                            <p className={`text-[11px] truncate mt-0.5 ${h.unread_count && h.unread_count > 0 ? "font-bold text-slate-900 dark:text-white" : "text-slate-400"}`}>
-                              {h.last_message || (h.common_interests ? h.common_interests[0] : "Past chat")}
+                            <p className={`text-[11px] truncate mt-0.5 ${h.unread_count > 0 ? "font-bold text-slate-900 dark:text-white" : "text-slate-400"}`}>
+                              {h.last_message || "Direct conversation"}
                             </p>
                           </div>
                         </div>
@@ -3818,7 +4165,7 @@ export default function Home() {
                       <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
                     </div>
                     <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-tight">
-                      Matched on {common[0] || "Music"} · {partnerLocation}
+                      Matched on {common[0] || "Music"}{partnerLocation ? ` · ${partnerLocation}` : ""}
                     </p>
                   </div>
                 </div>
@@ -4190,7 +4537,7 @@ export default function Home() {
                         </span>
                       )}
                     </div>
-                    <p className="text-[11px] text-slate-400 mt-0.5">{partnerLocation}</p>
+                    {partnerLocation && <p className="text-[11px] text-slate-400 mt-0.5">{partnerLocation}</p>}
                     {friendStatus === "friends" && partnerHandle && (
                       <div className="mt-1.5 inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-xs font-mono font-bold">
                         <span>@{partnerHandle}</span>
@@ -4290,7 +4637,7 @@ export default function Home() {
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-slate-500">{partnerLocation}</p>
+                    {partnerLocation && <p className="text-xs text-slate-500">{partnerLocation}</p>}
                     {friendStatus === "friends" && partnerHandle && (
                       <div className="mt-1 inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300 text-xs font-mono font-bold">
                         @{partnerHandle}

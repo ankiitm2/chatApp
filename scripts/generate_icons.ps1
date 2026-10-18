@@ -5,51 +5,91 @@ if (-not (Test-Path $iconsDir)) {
     New-Item -ItemType Directory -Force -Path $iconsDir | Out-Null
 }
 
-function Create-Icon([int]$sz, [string]$outName) {
+function Create-Dusk-Icon([int]$sz, [string]$outName) {
     $bmp = New-Object System.Drawing.Bitmap($sz, $sz)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
 
-    # Dark rounded background with slight border
-    $rect = New-Object System.Drawing.Rectangle(0, 0, $sz, $sz)
-    $cTop = [System.Drawing.Color]::FromArgb(255, 13, 16, 23)     # #0d1017
-    $cBottom = [System.Drawing.Color]::FromArgb(255, 91, 77, 242)  # #5b4df2
-    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $cTop, $cBottom, 45.0)
-    $g.FillRectangle($brush, $rect)
+    # Transparent canvas
+    $g.Clear([System.Drawing.Color]::Transparent)
 
-    # Soft glowing central aura
-    $center = $sz / 2.0
-    $orbRadius = $sz * 0.32
-    $glowBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(40, 255, 255, 255))
-    $g.FillEllipse($glowBrush, [float]($center - $orbRadius), [float]($center - $orbRadius), [float]($orbRadius * 2), [float]($orbRadius * 2))
+    # 1. Rounded rectangle squircle background
+    $radius = $sz * 0.24
+    $rect = New-Object System.Drawing.RectangleF(0, 0, $sz, $sz)
+    $bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $d = $radius * 2
+    $bgPath.AddArc(0, 0, $d, $d, 180, 90)
+    $bgPath.AddArc($sz - $d, 0, $d, $d, 270, 90)
+    $bgPath.AddArc($sz - $d, $sz - $d, $d, $d, 0, 90)
+    $bgPath.AddArc(0, $sz - $d, $d, $d, 90, 90)
+    $bgPath.CloseFigure()
 
-    # Signal arcs
-    $penWave = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 255, 255, 255), [float]($sz * 0.055))
-    $penWave.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $penWave.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    # Midnight gradient matching Dusk artwork (#232152 -> #141334)
+    $cTop = [System.Drawing.Color]::FromArgb(255, 38, 34, 86)     # #262256
+    $cBottom = [System.Drawing.Color]::FromArgb(255, 20, 19, 52)  # #141334
+    $bgBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $cTop, $cBottom, 45.0)
+    $g.FillPath($bgBrush, $bgPath)
 
-    # Outer signals
-    $w1 = $sz * 0.54
-    $g.DrawArc($penWave, [float]($center - $w1/2), [float]($center - $w1/2), [float]$w1, [float]$w1, -45.0, 90.0)
-    $g.DrawArc($penWave, [float]($center - $w1/2), [float]($center - $w1/2), [float]$w1, [float]$w1, 135.0, 90.0)
+    # Subtle inner border for contrast
+    $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(40, 255, 255, 255), [float]($sz * 0.02))
+    $g.DrawPath($borderPen, $bgPath)
 
-    # Inner signals
-    $w2 = $sz * 0.34
-    $g.DrawArc($penWave, [float]($center - $w2/2), [float]($center - $w2/2), [float]$w2, [float]$w2, -45.0, 90.0)
-    $g.DrawArc($penWave, [float]($center - $w2/2), [float]($center - $w2/2), [float]$w2, [float]$w2, 135.0, 90.0)
+    # 2. Glowing Crescent Moon
+    # Outer circle of crescent
+    $outerR = $sz * 0.27
+    $outerX = $sz * 0.44
+    $outerY = $sz * 0.52
 
-    # Center dot
-    $coreRadius = $sz * 0.075
-    $coreBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
-    $g.FillEllipse($coreBrush, [float]($center - $coreRadius), [float]($center - $coreRadius), [float]($coreRadius * 2), [float]($coreRadius * 2))
+    $outerPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $outerPath.AddEllipse([float]($outerX - $outerR), [float]($outerY - $outerR), [float]($outerR * 2), [float]($outerR * 2))
+
+    # Inner subtract circle
+    $innerR = $sz * 0.23
+    $innerX = $sz * 0.53
+    $innerY = $sz * 0.44
+
+    $innerPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $innerPath.AddEllipse([float]($innerX - $innerR), [float]($innerY - $innerR), [float]($innerR * 2), [float]($innerR * 2))
+
+    $moonRegion = New-Object System.Drawing.Region($outerPath)
+    $moonRegion.Exclude($innerPath)
+
+    # Soft ethereal moon color (#e3e6fc)
+    $moonColor = [System.Drawing.Color]::FromArgb(255, 227, 230, 252)
+    $moonBrush = New-Object System.Drawing.SolidBrush($moonColor)
+    $g.FillRegion($moonBrush, $moonRegion)
+
+    # 3. Warm amber star dot (#f6b856)
+    $starR = $sz * 0.046
+    $starX = $sz * 0.69
+    $starY = $sz * 0.29
+
+    # Star glow
+    $starGlowR = $starR * 1.8
+    $starGlowBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(60, 246, 184, 86))
+    $g.FillEllipse($starGlowBrush, [float]($starX - $starGlowR), [float]($starY - $starGlowR), [float]($starGlowR * 2), [float]($starGlowR * 2))
+
+    # Star core
+    $starBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 246, 184, 86))
+    $g.FillEllipse($starBrush, [float]($starX - $starR), [float]($starY - $starR), [float]($starR * 2), [float]($starR * 2))
 
     $target = Join-Path $iconsDir $outName
     $bmp.Save($target, [System.Drawing.Imaging.ImageFormat]::Png)
+
+    # Also copy 192 as app/favicon.ico and public/favicon.ico if small
+    if ($sz -eq 192) {
+        $pubFav = Join-Path $PSScriptRoot "..\public\favicon.ico"
+        $appFav = Join-Path $PSScriptRoot "..\app\favicon.ico"
+        $bmp.Save($pubFav, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Save($appFav, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+
     $g.Dispose()
     $bmp.Dispose()
-    Write-Output "Saved: $target"
+    Write-Output "Saved Dusk icon: $target"
 }
 
-Create-Icon 192 "icon-192.png"
-Create-Icon 512 "icon-512.png"
+Create-Dusk-Icon 192 "icon-192.png"
+Create-Dusk-Icon 512 "icon-512.png"

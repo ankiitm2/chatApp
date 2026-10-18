@@ -329,8 +329,75 @@ export async function fetchFriends(userId: string | null, userHandle?: string): 
   return Array.from(mergedFriendsMap.values());
 }
 
-// 5. Fetch Match History (dynamically ordered by latest message & includes unread counts)
-export async function fetchMatchHistory(userId: string | null, userHandle?: string): Promise<MatchHistoryItem[]> {
+export interface DirectConversationItem {
+  id: string;
+  partner_name: string;
+  partner_handle: string;
+  is_member: boolean;
+  last_message: string;
+  last_message_at: string;
+  unread_count: number;
+  last_status?: "sent" | "delivered" | "read";
+}
+
+// 5. Fetch Saved Conversations (Only for friends & direct chats with message history)
+export async function fetchSavedConversations(userHandle?: string): Promise<DirectConversationItem[]> {
+  if (!supabase || !userHandle) return [];
+  const clean = userHandle.toLowerCase().trim().replace(/^@/, "");
+
+  try {
+    const { data: dms, error } = await supabase
+      .from("direct_messages")
+      .select("id, sender_handle, receiver_handle, text, media_url, message_type, created_at, status")
+      .or(`sender_handle.eq.${clean},receiver_handle.eq.${clean}`)
+      .order("created_at", { ascending: false })
+      .limit(300);
+
+    if (error || !dms || dms.length === 0) return [];
+
+    const convMap = new Map<string, DirectConversationItem>();
+
+    dms.forEach((m: any) => {
+      const isSender = m.sender_handle.toLowerCase() === clean;
+      const partner = isSender ? m.receiver_handle : m.sender_handle;
+      if (!partner || partner.toLowerCase() === "stranger") return;
+      const pKey = partner.toLowerCase();
+
+      if (!convMap.has(pKey)) {
+        let snippet = m.text || "";
+        if (m.message_type === "image") snippet = "📷 Photo";
+        else if (m.message_type === "audio") snippet = "🎙️ Voice message";
+        else if (m.message_type === "sticker") snippet = "✨ Sticker";
+
+        convMap.set(pKey, {
+          id: `conv-${pKey}`,
+          partner_name: partner,
+          partner_handle: partner,
+          is_member: true,
+          last_message: snippet,
+          last_message_at: m.created_at,
+          unread_count: !isSender && m.status !== "read" ? 1 : 0,
+          last_status: isSender ? m.status : undefined,
+        });
+      } else {
+        const item = convMap.get(pKey)!;
+        if (!isSender && m.status !== "read") {
+          item.unread_count += 1;
+        }
+      }
+    });
+
+    return Array.from(convMap.values()).sort((a, b) => {
+      return new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime();
+    });
+  } catch (err) {
+    console.warn("fetchSavedConversations error:", err);
+    return [];
+  }
+}
+
+// 6. Fetch Past Matches (Pure stranger sessions - shows ONLY match name and topics, NO messages)
+export async function fetchMatchHistory(userId: string | null): Promise<MatchHistoryItem[]> {
   const historyMap = new Map<string, MatchHistoryItem>();
 
   // 1. Load from local storage
@@ -341,7 +408,12 @@ export async function fetchMatchHistory(userId: string | null, userHandle?: stri
         const list: MatchHistoryItem[] = JSON.parse(local);
         list.forEach((item) => {
           const key = (item.partner_handle || item.partner_name).toLowerCase();
-          historyMap.set(key, item);
+          historyMap.set(key, {
+            ...item,
+            last_message: undefined, // Ephemeral: never persist stranger messages!
+            last_message_at: undefined,
+            unread_count: 0,
+          });
         });
       }
     } catch {}
@@ -371,79 +443,9 @@ export async function fetchMatchHistory(userId: string | null, userHandle?: stri
     }
   }
 
-  // 3. Augment with latest message and unread count from direct_messages
-  if (supabase && userHandle) {
-    try {
-      const clean = userHandle.toLowerCase().trim().replace(/^@/, "");
-      const { data: dms } = await supabase
-        .from("direct_messages")
-        .select("id, sender_handle, receiver_handle, text, media_url, message_type, created_at, status")
-        .or(`sender_handle.eq.${clean},receiver_handle.eq.${clean}`)
-        .order("created_at", { ascending: false })
-        .limit(200);
-
-      if (dms && dms.length > 0) {
-        const unreadByPartner = new Map<string, number>();
-        const latestMsgByPartner = new Map<string, { snippet: string; at: string }>();
-
-        dms.forEach((m: any) => {
-          const isSender = m.sender_handle.toLowerCase() === clean;
-          const partner = isSender ? m.receiver_handle : m.sender_handle;
-          const pKey = partner.toLowerCase();
-
-          // Unread tally for messages sent to me that are not yet read
-          if (!isSender && m.status !== "read") {
-            unreadByPartner.set(pKey, (unreadByPartner.get(pKey) || 0) + 1);
-          }
-
-          if (!latestMsgByPartner.has(pKey)) {
-            let snippet = m.text || "";
-            if (m.message_type === "image") snippet = "📷 Photo";
-            else if (m.message_type === "audio") snippet = "🎙️ Voice message";
-            else if (m.message_type === "sticker") snippet = "✨ Sticker";
-
-            latestMsgByPartner.set(pKey, {
-              snippet,
-              at: m.created_at,
-            });
-          }
-        });
-
-        // Merge latest message snippet, timestamp, and unread counts
-        latestMsgByPartner.forEach((info, pKey) => {
-          const unread = unreadByPartner.get(pKey) || 0;
-          if (historyMap.has(pKey)) {
-            const existing = historyMap.get(pKey)!;
-            existing.last_message = info.snippet;
-            existing.last_message_at = info.at;
-            existing.unread_count = unread;
-          } else {
-            historyMap.set(pKey, {
-              id: `conv-${pKey}`,
-              partner_name: pKey,
-              partner_gender: "other",
-              partner_handle: pKey,
-              is_member: true,
-              common_interests: ["Direct Chat"],
-              had_video: false,
-              matched_at: info.at,
-              last_message: info.snippet,
-              last_message_at: info.at,
-              unread_count: unread,
-            });
-          }
-        });
-      }
-    } catch (err) {
-      console.warn("Error augmenting match history with messages:", err);
-    }
-  }
-
-  // Sort strictly by latest message date or matched date descending
+  // Sort strictly by matched date descending
   return Array.from(historyMap.values()).sort((a, b) => {
-    const timeA = new Date(a.last_message_at || a.matched_at).getTime();
-    const timeB = new Date(b.last_message_at || b.matched_at).getTime();
-    return timeB - timeA;
+    return new Date(b.matched_at).getTime() - new Date(a.matched_at).getTime();
   });
 }
 

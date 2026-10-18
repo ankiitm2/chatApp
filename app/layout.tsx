@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Quiet Signal - Ephemeral Stranger Chat",
-  description: "Anonymous encrypted stranger chat with shared signals, live video, and reserved member handles.",
+  title: "Dusk — Talk after dark",
+  description: "Talk after dark. Encrypted stranger chats, late-night voice notes, and private connections.",
   manifest: "/manifest.json",
   icons: {
     icon: "/icons/icon-192.png",
@@ -23,12 +23,12 @@ export const metadata: Metadata = {
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "Quiet Signal",
+    title: "Dusk",
   },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#5b4df2",
+  themeColor: "#0b0f19",
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
@@ -45,7 +45,7 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col bg-[#0b0f19] text-slate-100">{children}</body>
     </html>
   );
 }

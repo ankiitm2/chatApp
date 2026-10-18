@@ -1,12 +1,12 @@
 {
-  "name": "Quiet Signal - Ephemeral Stranger Chat",
-  "short_name": "Quiet Signal",
-  "description": "Encrypted ephemeral stranger chat and video calling with shared signals and verified handles.",
+  "name": "Dusk — Talk after dark",
+  "short_name": "Dusk",
+  "description": "Talk after dark. Encrypted stranger chats, late-night voice notes, and private connections.",
   "start_url": "/",
   "id": "/",
   "display": "standalone",
-  "background_color": "#0a0c10",
-  "theme_color": "#5b4df2",
+  "background_color": "#0b0f19",
+  "theme_color": "#0b0f19",
   "orientation": "portrait-primary",
   "icons": [
     {

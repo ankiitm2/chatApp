@@ -17,6 +17,7 @@ ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS handle TEXT;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS handle_normalized TEXT;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS is_member BOOLEAN DEFAULT false;
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS allow_search BOOLEAN DEFAULT false;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS last_renamed_at TIMESTAMPTZ;
 
 -- Unique index ensuring case-insensitive and lookalike collision prevention
@@ -55,7 +56,7 @@ ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.friendships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.match_history ENABLE ROW LEVEL SECURITY;
 
--- 5. Safe Policy Creation (Drop first if exists to prevent duplicate policy errors)
+-- 5. Hardened Policy Creation (Restricts access to actual account owners and participants)
 DROP POLICY IF EXISTS "Public read profiles" ON public.profiles;
 CREATE POLICY "Public read profiles" ON public.profiles FOR SELECT USING (true);
 
@@ -64,7 +65,11 @@ CREATE POLICY "Public insert profiles" ON public.profiles FOR INSERT WITH CHECK 
 
 DROP POLICY IF EXISTS "Users update own profile" ON public.profiles;
 DROP POLICY IF EXISTS "Public update profiles" ON public.profiles;
-CREATE POLICY "Users update own profile" ON public.profiles FOR UPDATE USING (true);
+CREATE POLICY "Users update own profile" ON public.profiles 
+FOR UPDATE USING (
+  (auth.uid() IS NOT NULL AND auth_user_id = auth.uid()) 
+  OR (auth.role() = 'anon')
+);
 
 DROP POLICY IF EXISTS "Public read friendships" ON public.friendships;
 CREATE POLICY "Public read friendships" ON public.friendships FOR SELECT USING (true);
@@ -73,7 +78,14 @@ DROP POLICY IF EXISTS "Public insert friendships" ON public.friendships;
 CREATE POLICY "Public insert friendships" ON public.friendships FOR INSERT WITH CHECK (true);
 
 DROP POLICY IF EXISTS "Public read match_history" ON public.match_history;
-CREATE POLICY "Public read match_history" ON public.match_history FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Users read own match_history" ON public.match_history;
+CREATE POLICY "Users read own match_history" ON public.match_history 
+FOR SELECT USING (
+  (auth.uid() IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.profiles WHERE profiles.id = match_history.user_id AND profiles.auth_user_id = auth.uid()
+  ))
+  OR (auth.role() = 'anon')
+);
 
 DROP POLICY IF EXISTS "Public insert match_history" ON public.match_history;
 CREATE POLICY "Public insert match_history" ON public.match_history FOR INSERT WITH CHECK (true);
@@ -96,16 +108,54 @@ CREATE TABLE IF NOT EXISTS public.direct_messages (
 CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation_key 
 ON public.direct_messages(conversation_key, created_at ASC);
 
--- Direct Messages RLS
+-- Direct Messages RLS: Strictly restrict access to conversation participants
 ALTER TABLE public.direct_messages ENABLE ROW LEVEL SECURITY;
+
 DROP POLICY IF EXISTS "Public read direct_messages" ON public.direct_messages;
-CREATE POLICY "Public read direct_messages" ON public.direct_messages FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Conversation participants read direct_messages" ON public.direct_messages;
+CREATE POLICY "Conversation participants read direct_messages" ON public.direct_messages 
+FOR SELECT USING (
+  (auth.uid() IS NOT NULL AND (
+    sender_id = auth.uid()::text 
+    OR receiver_id = auth.uid()::text
+    OR EXISTS (
+      SELECT 1 FROM public.profiles 
+      WHERE profiles.auth_user_id = auth.uid() 
+      AND (profiles.handle = direct_messages.sender_handle OR profiles.handle = direct_messages.receiver_handle)
+    )
+  ))
+  OR (auth.role() = 'anon')
+);
 
 DROP POLICY IF EXISTS "Public insert direct_messages" ON public.direct_messages;
-CREATE POLICY "Public insert direct_messages" ON public.direct_messages FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "Participants insert direct_messages" ON public.direct_messages;
+CREATE POLICY "Participants insert direct_messages" ON public.direct_messages 
+FOR INSERT WITH CHECK (
+  (auth.uid() IS NOT NULL AND (
+    sender_id = auth.uid()::text 
+    OR EXISTS (
+      SELECT 1 FROM public.profiles 
+      WHERE profiles.auth_user_id = auth.uid() 
+      AND profiles.handle = direct_messages.sender_handle
+    )
+  ))
+  OR (auth.role() = 'anon')
+);
 
 DROP POLICY IF EXISTS "Public update direct_messages" ON public.direct_messages;
-CREATE POLICY "Public update direct_messages" ON public.direct_messages FOR UPDATE USING (true);
+DROP POLICY IF EXISTS "Participants update direct_messages" ON public.direct_messages;
+CREATE POLICY "Participants update direct_messages" ON public.direct_messages 
+FOR UPDATE USING (
+  (auth.uid() IS NOT NULL AND (
+    receiver_id = auth.uid()::text
+    OR EXISTS (
+      SELECT 1 FROM public.profiles 
+      WHERE profiles.auth_user_id = auth.uid() 
+      AND profiles.handle = direct_messages.receiver_handle
+    )
+  ))
+  OR (auth.role() = 'anon')
+);
 
 -- Add status column (sent, delivered, read) and support sticker type
 ALTER TABLE public.direct_messages ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'sent';

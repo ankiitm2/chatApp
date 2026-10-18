@@ -3,11 +3,19 @@ import fs from "fs";
 import path from "path";
 import next from "next";
 import { Server } from "socket.io";
+import { createClient } from "@supabase/supabase-js";
 
 const dev = process.env.NODE_ENV !== "production";
 const app = next({ dev });
 const handle = app.getRequestHandler();
 await app.prepare();
+
+const supabaseAdmin = (process.env.NEXT_PUBLIC_SUPABASE_URL && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY))
+  ? createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    )
+  : null;
 
 const httpServer = createServer((req, res) => {
   const cleanUrl = (req.url || "").split("?")[0];
@@ -31,8 +39,19 @@ const io = new Server(httpServer, {
 
 const waiting = []; // { id, nick, interests }
 const partners = new Map(); // socketId -> socketId
-const onlineUsers = new Map(); // handle_normalized -> { socketId, nick, handle, isMember }
+const onlineUsers = new Map(); // handle_normalized -> { socketId, nick, handle, isMember, allowSearch, blockedHandles: Set }
 const socketToUser = new Map(); // socketId -> handle_normalized
+const pendingInvites = new Map(); // inviteId -> { id, fromSocketId, toSocketId, fromHandle, toHandle, createdAt }
+
+// Auto cleanup pending invites older than 60 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, inv] of pendingInvites.entries()) {
+    if (now - inv.createdAt > 60000) {
+      pendingInvites.delete(id);
+    }
+  }
+}, 30000);
 
 const dequeue = (id) => {
   const i = waiting.findIndex((w) => w.id === id);
@@ -68,8 +87,10 @@ function match(me) {
     style: other.style,
     isMember: !!other.isMember,
     handle: other.handle || null,
+    region: other.region || null,
     common,
     isInitiator: true,
+    isDirect: false,
   });
   io.to(other.id).emit("matched", {
     nick: me.nick,
@@ -78,8 +99,10 @@ function match(me) {
     style: me.style,
     isMember: !!me.isMember,
     handle: me.handle || null,
+    region: me.region || null,
     common,
     isInitiator: false,
+    isDirect: false,
   });
 }
 
@@ -89,7 +112,7 @@ io.on("connection", (socket) => {
   onlineCount++;
   io.emit("online-count", onlineCount);
 
-  socket.on("find", ({ nick, gender, interests, style, isMember, handle }) => {
+  socket.on("find", ({ nick, gender, interests, style, isMember, handle, region }) => {
     unpair(socket.id);
     dequeue(socket.id);
     const clean = (Array.isArray(interests) ? interests : [])
@@ -105,6 +128,7 @@ io.on("connection", (socket) => {
       style: style || "text",
       isMember: !!isMember,
       handle: handle ? String(handle).trim().replace(/^@/, "").slice(0, 20) : null,
+      region: region ? String(region).slice(0, 40) : null,
     });
   });
 
@@ -185,9 +209,33 @@ io.on("connection", (socket) => {
 
     // Inform sender that message was delivered to recipient's active socket
     if (delivered && payload && typeof payload === "object" && payload.id) {
-      socket.emit("message-delivered", {
-        messageId: payload.id,
-        toHandle: payload.toHandle,
+      // Recipient will send explicit message-ack, but for transient stranger sockets acknowledge delivery:
+      if (p) {
+        socket.emit("message-delivered", {
+          messageId: payload.id,
+        });
+      }
+    }
+  });
+
+  // Explicit message delivery receipt acknowledgment from recipient client
+  socket.on("message-ack", ({ messageId, fromHandle }) => {
+    if (!messageId) return;
+    const recipientHandle = socketToUser.get(socket.id);
+    if (fromHandle) {
+      const senderNorm = String(fromHandle).toLowerCase().trim().replace(/^@/, "");
+      const senderTarget = onlineUsers.get(senderNorm);
+      if (senderTarget && senderTarget.socketId) {
+        io.to(senderTarget.socketId).emit("message-delivered", {
+          messageId,
+          toHandle: recipientHandle,
+        });
+      }
+    }
+    const p = partners.get(socket.id);
+    if (p) {
+      io.to(p).emit("message-delivered", {
+        messageId,
       });
     }
   });
@@ -209,39 +257,69 @@ io.on("connection", (socket) => {
   });
 
   socket.on("direct-message", (payload) => {
-    if (payload && payload.toHandle) {
-      const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
-      const target = onlineUsers.get(norm);
-      if (target && target.socketId && target.socketId !== socket.id) {
-        io.to(target.socketId).emit("direct-message", payload);
-        io.to(target.socketId).emit("message", payload);
-        if (payload.id) {
-          socket.emit("message-delivered", {
-            messageId: payload.id,
-            toHandle: payload.toHandle,
-          });
-        }
-      }
+    if (!payload || !payload.toHandle) return;
+    const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
+    const target = onlineUsers.get(norm);
+    const senderNorm = socketToUser.get(socket.id);
+
+    // Enforce verified sender handle from server session
+    if (senderNorm) {
+      payload.fromHandle = senderNorm;
+    }
+
+    // Check if target blocked sender
+    if (target && target.blockedHandles && senderNorm && target.blockedHandles.has(senderNorm)) {
+      return; // Silently drop blocked messages
+    }
+
+    if (target && target.socketId && target.socketId !== socket.id) {
+      io.to(target.socketId).emit("direct-message", payload);
+      io.to(target.socketId).emit("message", payload);
     }
   });
 
-  socket.on("register-identity", (info) => {
-    if (info && info.handle) {
-      const norm = String(info.handle).toLowerCase().trim().replace(/^@/, "");
-      onlineUsers.set(norm, {
-        socketId: socket.id,
-        nick: info.nick || info.handle,
-        handle: info.handle,
-        isMember: !!info.isMember,
-      });
-      socketToUser.set(socket.id, norm);
-      socket.emit("registered", { handle: norm });
+  socket.on("register-identity", async (info) => {
+    if (!info || !info.handle) return;
+    const norm = String(info.handle).toLowerCase().trim().replace(/^@/, "");
+    let isMember = false;
+
+    // Verify token with Supabase if provided to prevent handle impersonation
+    if (info.token && supabaseAdmin) {
+      try {
+        const { data: { user }, error } = await supabaseAdmin.auth.getUser(info.token);
+        if (!error && user) {
+          isMember = true;
+        }
+      } catch (err) {
+        console.warn("Token verification failed:", err);
+      }
+    } else if (info.isMember) {
+      // Fallback if already member
+      isMember = true;
     }
+
+    const blockedSet = new Set(
+      (Array.isArray(info.blockedHandles) ? info.blockedHandles : [])
+        .map((h) => String(h).toLowerCase().trim().replace(/^@/, ""))
+        .filter(Boolean)
+    );
+
+    onlineUsers.set(norm, {
+      socketId: socket.id,
+      nick: info.nick || info.handle,
+      handle: info.handle,
+      isMember,
+      allowSearch: info.allowSearch !== false,
+      blockedHandles: blockedSet,
+    });
+    socketToUser.set(socket.id, norm);
+    socket.emit("registered", { handle: norm, isMember });
   });
 
   socket.on("direct-chat-request", ({ targetHandle, senderInfo }) => {
     const norm = String(targetHandle || "").toLowerCase().trim().replace(/^@/, "");
     const target = onlineUsers.get(norm);
+    const senderHandleNorm = socketToUser.get(socket.id) || (senderInfo?.handle ? String(senderInfo.handle).toLowerCase().trim().replace(/^@/, "") : null);
 
     if (!target) {
       socket.emit("direct-chat-error", { message: `@${targetHandle} is currently offline.` });
@@ -253,37 +331,75 @@ io.on("connection", (socket) => {
       return;
     }
 
+    // Check if target blocked sender
+    if (senderHandleNorm && target.blockedHandles && target.blockedHandles.has(senderHandleNorm)) {
+      socket.emit("direct-chat-error", { message: `@${targetHandle} is currently unavailable.` });
+      return;
+    }
+
+    // Consent: Check if target user allows handle search / discovery
+    if (target.allowSearch === false) {
+      socket.emit("direct-chat-error", { message: `@${targetHandle} does not accept direct search requests.` });
+      return;
+    }
+
     if (partners.has(target.socketId)) {
       socket.emit("direct-chat-error", { message: `@${targetHandle} is currently in another conversation.` });
       return;
     }
 
-    io.to(target.socketId).emit("direct-chat-invite", {
+    const inviteId = "inv_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
+    pendingInvites.set(inviteId, {
+      id: inviteId,
       fromSocketId: socket.id,
-      fromNick: senderInfo?.nick || "A friend",
-      fromHandle: senderInfo?.handle || null,
+      toSocketId: target.socketId,
+      fromHandle: senderHandleNorm,
+      toHandle: norm,
+      createdAt: Date.now(),
+    });
+
+    io.to(target.socketId).emit("direct-chat-invite", {
+      inviteId,
+      fromSocketId: socket.id,
+      fromNick: senderInfo?.nick || (senderHandleNorm ? `@${senderHandleNorm}` : "A friend"),
+      fromHandle: senderHandleNorm || senderInfo?.handle || null,
       fromIsMember: !!senderInfo?.isMember,
     });
   });
 
-  socket.on("direct-chat-response", ({ accepted, fromSocketId, targetInfo }) => {
+  socket.on("direct-chat-response", ({ inviteId, accepted, fromSocketId, targetInfo }) => {
+    let invite = null;
+    if (inviteId && pendingInvites.has(inviteId)) {
+      invite = pendingInvites.get(inviteId);
+      pendingInvites.delete(inviteId);
+    }
+
+    const requesterSocketId = invite ? invite.fromSocketId : fromSocketId;
+
     if (!accepted) {
-      io.to(fromSocketId).emit("direct-chat-error", { message: "The invitation was declined." });
+      if (requesterSocketId) {
+        io.to(requesterSocketId).emit("direct-chat-error", { message: "The invitation was declined." });
+      }
+      return;
+    }
+
+    if (!requesterSocketId || !io.sockets.sockets.has(requesterSocketId)) {
+      socket.emit("direct-chat-error", { message: "The user who invited you is no longer connected." });
       return;
     }
 
     unpair(socket.id);
     dequeue(socket.id);
-    unpair(fromSocketId);
-    dequeue(fromSocketId);
+    unpair(requesterSocketId);
+    dequeue(requesterSocketId);
 
-    partners.set(socket.id, fromSocketId);
-    partners.set(fromSocketId, socket.id);
+    partners.set(socket.id, requesterSocketId);
+    partners.set(requesterSocketId, socket.id);
 
-    const senderHandleNorm = socketToUser.get(fromSocketId);
+    const senderHandleNorm = socketToUser.get(requesterSocketId);
     const sender = senderHandleNorm ? onlineUsers.get(senderHandleNorm) : null;
 
-    io.to(fromSocketId).emit("matched", {
+    io.to(requesterSocketId).emit("matched", {
       nick: targetInfo?.nick || "Friend",
       gender: "other",
       interests: ["Direct Connection"],
@@ -292,6 +408,7 @@ io.on("connection", (socket) => {
       handle: targetInfo?.handle || null,
       common: ["Direct Connection"],
       isInitiator: true,
+      isDirect: true,
     });
 
     io.to(socket.id).emit("matched", {
@@ -303,12 +420,18 @@ io.on("connection", (socket) => {
       handle: sender?.handle || null,
       common: ["Direct Connection"],
       isInitiator: false,
+      isDirect: true,
     });
   });
 
   const leave = () => {
     unpair(socket.id);
     dequeue(socket.id);
+    for (const [id, inv] of pendingInvites.entries()) {
+      if (inv.fromSocketId === socket.id || inv.toSocketId === socket.id) {
+        pendingInvites.delete(id);
+      }
+    }
     const h = socketToUser.get(socket.id);
     if (h) {
       onlineUsers.delete(h);
