@@ -79,8 +79,10 @@ function sanitizePayload(raw) {
   }
   const id = typeof raw.id === "string" ? raw.id.slice(0, 64) : ("m_" + Date.now());
   const toHandle = typeof raw.toHandle === "string" ? raw.toHandle.slice(0, 32) : undefined;
+  const fromHandle = typeof raw.fromHandle === "string" ? raw.fromHandle.slice(0, 32) : undefined;
+  const fromNick = typeof raw.fromNick === "string" ? raw.fromNick.slice(0, 32) : undefined;
   const time = typeof raw.time === "string" ? raw.time.slice(0, 16) : undefined;
-  return { id, type, text, mediaUrl, toHandle, time };
+  return { id, type, text, mediaUrl, toHandle, fromHandle, fromNick, time };
 }
 
 const dequeue = (id) => {
@@ -182,59 +184,79 @@ io.on("connection", (socket) => {
     });
   });
 
+  const resolveTargetSocket = (data) => {
+    let p = partners.get(socket.id);
+    if (!p && data && typeof data === "object" && data.toHandle) {
+      const norm = String(data.toHandle).toLowerCase().trim().replace(/^@/, "");
+      const u = onlineUsers.get(norm);
+      if (u && u.socketId && u.socketId !== socket.id) {
+        p = u.socketId;
+      }
+    }
+    return p;
+  };
+
   socket.on("signal", (data) => {
-    const p = partners.get(socket.id);
+    const p = resolveTargetSocket(data);
     if (p) {
       io.to(p).emit("signal", data);
     }
   });
 
   socket.on("video-state", (state) => {
-    const p = partners.get(socket.id);
+    const p = resolveTargetSocket(state);
     if (p) {
       io.to(p).emit("video-state", state);
     }
   });
 
   socket.on("call-request", (data) => {
-    const p = partners.get(socket.id);
+    const p = resolveTargetSocket(data);
     if (p) {
       io.to(p).emit("call-request", data);
+    } else {
+      socket.emit("direct-chat-error", { message: "Partner is currently offline or unavailable for video." });
     }
   });
 
-  socket.on("call-cancel", () => {
-    const p = partners.get(socket.id);
+  socket.on("call-cancel", (data) => {
+    const p = resolveTargetSocket(data);
     if (p) {
-      io.to(p).emit("call-cancel");
+      io.to(p).emit("call-cancel", data);
     }
   });
 
   socket.on("call-response", (data) => {
-    const p = partners.get(socket.id);
+    const p = resolveTargetSocket(data);
     if (p) {
+      if (data && data.accepted) {
+        partners.set(socket.id, p);
+        partners.set(p, socket.id);
+      }
       io.to(p).emit("call-response", data);
     }
   });
 
   socket.on("friend-request", (senderInfo) => {
-    const p = partners.get(socket.id);
+    const p = resolveTargetSocket(senderInfo);
     if (p) {
       io.to(p).emit("friend-request", senderInfo);
     }
   });
 
   socket.on("friend-accept", (acceptInfo) => {
-    const p = partners.get(socket.id);
+    const p = resolveTargetSocket(acceptInfo);
     if (p) {
       io.to(p).emit("friend-accept", acceptInfo);
     }
   });
 
-  socket.on("call-end", () => {
-    const p = partners.get(socket.id);
+  socket.on("call-end", (data) => {
+    const p = resolveTargetSocket(data);
     if (p) {
-      io.to(p).emit("call-end");
+      partners.delete(socket.id);
+      partners.delete(p);
+      io.to(p).emit("call-end", data);
     }
   });
 
@@ -245,6 +267,11 @@ io.on("connection", (socket) => {
     }
     const payload = sanitizePayload(rawPayload);
     if (!payload) return;
+
+    const senderNorm = socketToUser.get(socket.id);
+    if (senderNorm) {
+      payload.fromHandle = senderNorm;
+    }
 
     const p = partners.get(socket.id);
     let delivered = false;
@@ -259,18 +286,19 @@ io.on("connection", (socket) => {
       const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
       const target = onlineUsers.get(norm);
       if (target && target.socketId && target.socketId !== socket.id && target.socketId !== p) {
-        io.to(target.socketId).emit("message", payload);
-        delivered = true;
+        if (!(target.blockedHandles && senderNorm && target.blockedHandles.has(senderNorm))) {
+          io.to(target.socketId).emit("direct-message", payload);
+          io.to(target.socketId).emit("message", payload);
+          delivered = true;
+        }
       }
     }
 
     // Inform sender that message was delivered to recipient's active socket
     if (delivered && payload.id) {
-      if (p) {
-        socket.emit("message-delivered", {
-          messageId: payload.id,
-        });
-      }
+      socket.emit("message-delivered", {
+        messageId: payload.id,
+      });
     }
   });
 

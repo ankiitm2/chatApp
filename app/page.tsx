@@ -123,6 +123,8 @@ const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
     {
       urls: [
         "turn:openrelay.metered.ca:80",
@@ -134,7 +136,7 @@ const ICE_SERVERS: RTCConfiguration = {
       credential: "openrelayproject",
     },
   ],
-  iceTransportPolicy: "relay", // Force TURN relay mode to prevent IP exposure to peer
+  iceCandidatePoolSize: 10,
 };
 
 export default function Home() {
@@ -143,6 +145,9 @@ export default function Home() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const candidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const callTimeoutTimerRef = useRef<NodeJS.Timeout | null>(null);
   const undoSkipTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -426,12 +431,25 @@ export default function Home() {
       setCurrentMember(stored);
       if (stored.handle) {
         setNick(stored.handle);
-        fetchSavedConversations(stored.handle).then(setSavedConversations);
+        fetchSavedConversations(stored.handle).then((convos) => {
+          setSavedConversations(convos);
+          setPhase("history"); // Instantly direct logged-in members to their Chats & Conversations Hub!
+        });
       }
       setUserId(stored.id);
       setMobileStep(2); // Skip Step 1 for signed-in members
       fetchFriends(stored.id, stored.handle).then(setFriendsList);
       fetchMatchHistory(stored.id).then(setHistoryList);
+
+      try {
+        const savedTopics = localStorage.getItem("dusk_member_topics");
+        if (savedTopics) {
+          const parsed = JSON.parse(savedTopics);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setSelectedTopics(parsed);
+          }
+        }
+      } catch {}
     } else {
       fetchFriends(null).then(setFriendsList);
       fetchMatchHistory(null).then(setHistoryList);
@@ -553,6 +571,7 @@ export default function Home() {
       clearTimeout(callTimeoutTimerRef.current);
       callTimeoutTimerRef.current = null;
     }
+    candidateQueueRef.current = [];
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
       pcRef.current.ontrack = null;
@@ -563,6 +582,8 @@ export default function Home() {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
     }
+    setLocalStream(null);
+    setRemoteStream(null);
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
     }
@@ -588,13 +609,23 @@ export default function Home() {
 
     pc.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {
-        socketRef.current.emit("signal", { candidate: event.candidate });
+        socketRef.current.emit("signal", {
+          candidate: event.candidate,
+          toHandle: partnerHandleRef.current || partnerRef.current,
+        });
       }
     };
 
     pc.ontrack = (event) => {
-      if (remoteVideoRef.current && event.streams[0]) {
-        remoteVideoRef.current.srcObject = event.streams[0];
+      if (event.streams && event.streams[0]) {
+        const stream = event.streams[0];
+        setRemoteStream(stream);
+        if (stream.getVideoTracks().length > 0) {
+          setRemoteHasVideo(true);
+        }
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+        }
       }
     };
 
@@ -627,6 +658,7 @@ export default function Home() {
 
       const stream = await acquireLocalMedia(!userDisabledInitialCam);
       localStreamRef.current = stream;
+      setLocalStream(stream);
 
       if (stream) {
         setHasLocalMedia(true);
@@ -636,12 +668,18 @@ export default function Home() {
         if (userDisabledInitialCam) {
           setIsCamOff(true);
         }
-        socketRef.current?.emit("video-state", { enabled: !userDisabledInitialCam });
+        socketRef.current?.emit("video-state", {
+          enabled: !userDisabledInitialCam,
+          toHandle: partnerHandleRef.current || partnerRef.current,
+        });
       } else {
         setHasLocalMedia(false);
         setIsCamOff(true);
-        setVideoError("Microphone/Camera not detected. You can still view and hear the stranger.");
-        socketRef.current?.emit("video-state", { enabled: false });
+        setVideoError("Microphone/Camera not detected. You can still view and hear your partner.");
+        socketRef.current?.emit("video-state", {
+          enabled: false,
+          toHandle: partnerHandleRef.current || partnerRef.current,
+        });
       }
 
       const pc = createPeerConnection();
@@ -659,17 +697,34 @@ export default function Home() {
       if (isCaller) {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        socketRef.current?.emit("signal", { sdp: pc.localDescription });
+        socketRef.current?.emit("signal", {
+          sdp: pc.localDescription,
+          toHandle: partnerHandleRef.current || partnerRef.current,
+        });
       }
     },
     [acquireLocalMedia, createPeerConnection]
   );
 
+  // Sync streams with video DOM elements whenever they become available or viewport switches
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream;
+    }
+  }, [localStream, isVideoActive]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+  }, [remoteStream, isVideoActive]);
+
   // Stop video call locally and notify the partner via call-end
   const stopVideo = () => {
     cleanupMediaAndPeer();
-    socketRef.current?.emit("call-end");
-    socketRef.current?.emit("video-state", { enabled: false });
+    const target = partnerHandle || partner;
+    socketRef.current?.emit("call-end", { toHandle: target });
+    socketRef.current?.emit("video-state", { enabled: false, toHandle: target });
     setIsVideoActive(false);
     setShowToast("Left video call. Back to text chat.");
     setTimeout(() => setShowToast(null), 2500);
@@ -798,7 +853,7 @@ export default function Home() {
 
       // Persist to direct_messages ONLY if this is a direct/friend conversation (never for ephemeral stranger chats!)
       const targetPartner = fromHandle || currentActivePartnerHandle;
-      if (activeMyHandle && targetPartner && targetPartner !== "Stranger" && (isDirectForOther || isDirectChat)) {
+      if (activeMyHandle && targetPartner && targetPartner !== "Stranger" && (isDirectForOther || isDirectChat || fromHandle)) {
         saveDirectMessage({
           id: msgId,
           senderHandle: targetPartner,
@@ -806,7 +861,7 @@ export default function Home() {
           messageType: msgType,
           text,
           mediaUrl,
-          status: !isDirectForOther ? "read" : "delivered",
+          status: (!isDirectForOther && phase === "chat") ? "read" : "delivered",
         });
         fetchSavedConversations(activeMyHandle).then(setSavedConversations);
         const savedId = currentMemberRef.current?.id || null;
@@ -817,16 +872,15 @@ export default function Home() {
       const preview = msgType === "sticker" 
         ? `✨ Sent sticker ${text}` 
         : text || (msgType === "image" ? "📷 Sent an image" : "🎙️ Voice message");
-      if (isDirectForOther) {
-        setShowToast(`New message from @${fromHandle}: ${preview.slice(0, 40)}`);
+      if (isDirectForOther || phase !== "chat") {
+        setShowToast(`New message from @${fromHandle || targetPartner}: ${preview.slice(0, 40)}`);
         playNotificationChime();
-        sendAppNotification(`@${fromHandle}`, { body: preview, tag: `chat-${fromHandle}` });
+        sendAppNotification(`@${fromHandle || targetPartner}`, { body: preview, tag: `chat-${fromHandle || targetPartner}` });
       } else if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
         sendAppNotification(fromHandle ? `@${fromHandle}` : "Dusk", {
           body: preview,
           tag: "chat-msg",
         });
-      } else {
         playNotificationChime();
       }
     };
@@ -955,13 +1009,36 @@ export default function Home() {
 
           if (data.sdp) {
             await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            while (candidateQueueRef.current.length > 0) {
+              const cand = candidateQueueRef.current.shift();
+              if (cand) {
+                await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+              }
+            }
+
             if (data.sdp.type === "offer") {
+              if (!localStreamRef.current) {
+                const stream = await acquireLocalMedia(!previewCameraMuted);
+                localStreamRef.current = stream;
+                setLocalStream(stream);
+                if (stream) {
+                  setHasLocalMedia(true);
+                  stream.getTracks().forEach((track) => pc!.addTrack(track, stream));
+                }
+              }
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
-              s.emit("signal", { sdp: pc.localDescription });
+              s.emit("signal", {
+                sdp: pc.localDescription,
+                toHandle: partnerHandleRef.current || partnerRef.current,
+              });
             }
           } else if (data.candidate) {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            if (pc.remoteDescription && pc.remoteDescription.type) {
+              await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
+            } else {
+              candidateQueueRef.current.push(data.candidate);
+            }
           }
         } catch (err) {
           console.error("Signal error:", err);
@@ -1247,7 +1324,7 @@ export default function Home() {
   };
 
   const find = async (overrideNick?: string, overrideMember?: AuthMember | null) => {
-    if (!isAgeConfirmed) return;
+    if (!currentMember && !isAgeConfirmed) return;
     setGuestNickWarning(null);
 
     const activeMember = overrideMember !== undefined ? overrideMember : currentMember;
@@ -1823,13 +1900,17 @@ export default function Home() {
     if (outgoingCallWaiting) return;
     setOutgoingCallWaiting(true);
     setCallDeclinedMessage(null);
-    socketRef.current?.emit("call-request", { from: nick });
+    const target = partnerHandle || partner;
+    socketRef.current?.emit("call-request", {
+      from: currentMember?.handle || nick,
+      toHandle: target,
+    });
 
     if (callTimeoutTimerRef.current) clearTimeout(callTimeoutTimerRef.current);
     callTimeoutTimerRef.current = setTimeout(() => {
       setOutgoingCallWaiting(false);
-      setCallDeclinedMessage("No answer from stranger");
-      socketRef.current?.emit("call-cancel");
+      setCallDeclinedMessage("No answer from partner");
+      socketRef.current?.emit("call-cancel", { toHandle: target });
       setTimeout(() => setCallDeclinedMessage(null), 4000);
     }, 25000);
   };
@@ -1837,27 +1918,31 @@ export default function Home() {
   const cancelCallRequest = () => {
     if (callTimeoutTimerRef.current) clearTimeout(callTimeoutTimerRef.current);
     setOutgoingCallWaiting(false);
-    socketRef.current?.emit("call-cancel");
+    const target = partnerHandle || partner;
+    socketRef.current?.emit("call-cancel", { toHandle: target });
     setShowToast("Video request cancelled.");
     setTimeout(() => setShowToast(null), 2500);
   };
 
   const acceptVideoCall = async () => {
     setIncomingCallRequest(false);
-    socketRef.current?.emit("call-response", { accepted: true });
+    const target = partnerHandle || partner;
+    socketRef.current?.emit("call-response", { accepted: true, toHandle: target });
     await establishCall(false, previewCameraMuted);
   };
 
   const declineVideoCall = () => {
     setIncomingCallRequest(false);
-    socketRef.current?.emit("call-response", { accepted: false });
+    const target = partnerHandle || partner;
+    socketRef.current?.emit("call-response", { accepted: false, toHandle: target });
     setShowToast("Declined video call.");
     setTimeout(() => setShowToast(null), 2500);
   };
 
   const blockFromCallModal = () => {
     setIncomingCallRequest(false);
-    socketRef.current?.emit("call-response", { accepted: false });
+    const target = partnerHandle || partner;
+    socketRef.current?.emit("call-response", { accepted: false, toHandle: target });
     setShowToast(`${partner} was blocked.`);
     next();
   };
@@ -2827,84 +2912,136 @@ export default function Home() {
               
               {/* Left Column */}
               <div className="lg:col-span-6 space-y-5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/80 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-300 text-xs font-semibold">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span>Private matching active</span>
-                  </div>
-
-                  <span className="inline-flex items-center px-2.5 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-[11px] font-bold">
-                    18+ community
-                  </span>
-                </div>
-
-                <div className="space-y-3">
-                  <h2 className="text-3xl sm:text-4xl lg:text-[42px] font-black text-slate-900 dark:text-white tracking-tight leading-[1.15]">
-                    Meet someone new, without the pressure.
-                  </h2>
-                  <p className="text-slate-600 dark:text-slate-300 text-sm sm:text-base leading-relaxed">
-                    Choose a few signals and we&apos;ll introduce you to someone who wants the same kind of conversation. No profiles, no pressure, leave whenever.
-                  </p>
-                </div>
-
-                {/* Soft First Conversation Preview */}
-                <div className="hidden sm:block p-4 sm:p-5 rounded-3xl bg-slate-50/80 dark:bg-slate-800/40 border border-slate-200/70 dark:border-slate-800 space-y-3">
-                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 flex items-center justify-between">
-                    <span>What a first chat looks like</span>
-                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold lowercase">matched on music</span>
-                  </div>
-
-                  <div className="flex items-start gap-2.5">
-                    {renderAvatar("River", "w-7 h-7 text-xs")}
-                    <div className="bg-white dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs px-3.5 py-2 rounded-2xl rounded-tl-xs shadow-2xs max-w-[85%]">
-                      Hey there! What kind of music are you listening to tonight?
+                {currentMember ? (
+                  <div className="space-y-5">
+                    <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200/80 dark:border-indigo-800/60 text-[#5b4df2] dark:text-indigo-400 text-xs font-semibold">
+                      <span>🌙</span>
+                      <span>Welcome back, @{currentMember.handle}</span>
                     </div>
-                  </div>
 
-                  <div className="flex items-end justify-end gap-2.5">
-                    <div className="bg-[#5b4df2] text-white text-xs px-3.5 py-2 rounded-2xl rounded-tr-xs shadow-2xs max-w-[85%]">
-                      A lot of mellow indie. Trying to build a rainy-day playlist 🌧️
+                    <div className="space-y-2">
+                      <h2 className="text-3xl sm:text-4xl lg:text-[42px] font-black text-slate-900 dark:text-white tracking-tight leading-[1.15]">
+                        Match with someone new tonight.
+                      </h2>
+                      <p className="text-slate-600 dark:text-slate-300 text-sm sm:text-base leading-relaxed">
+                        Pick your signals on the right to start a late-night chat. Your verified handle stays completely anonymous until you both choose to connect.
+                      </p>
                     </div>
-                  </div>
 
-                  <div className="flex items-start gap-2.5">
-                    {renderAvatar("River", "w-7 h-7 text-xs")}
-                    <div className="bg-white dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs px-3.5 py-2 rounded-2xl rounded-tl-xs shadow-2xs max-w-[85%]">
-                      Indie folk is the best for that. Have you heard the new Fleet Foxes?
+                    {/* Member Quick Summary Card */}
+                    <div className="p-5 rounded-3xl bg-indigo-50/70 dark:bg-slate-800/50 border border-indigo-100/80 dark:border-slate-800 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-slate-900 dark:text-white">Your Conversations</span>
+                        <button
+                          type="button"
+                          onClick={() => setPhase("history")}
+                          className="text-xs font-semibold text-[#5b4df2] dark:text-indigo-400 hover:underline cursor-pointer"
+                        >
+                          Open Chats Hub →
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-600 dark:text-slate-400">
+                        You have {savedConversations.length} saved direct {savedConversations.length === 1 ? "chat" : "chats"} and {friendsList.length} connected {friendsList.length === 1 ? "friend" : "friends"}.
+                      </p>
+                      {totalUnread > 0 && (
+                        <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#5b4df2] text-white text-xs font-bold shadow-xs">
+                          <span>🔔</span>
+                          <span>{totalUnread} unread messages waiting</span>
+                        </div>
+                      )}
                     </div>
-                  </div>
-                </div>
 
-                {/* Trust and Safety Commitments (Compact 2x2 Grid) */}
-                <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-700 dark:text-slate-300 font-medium pt-1">
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
-                    <svg className="w-3.5 h-3.5 text-[#5b4df2] shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-                    </svg>
-                    <span className="truncate">Anonymous by default</span>
+                    <button
+                      type="button"
+                      onClick={() => setPhase("history")}
+                      className="w-full py-3.5 px-5 rounded-2xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700/80 text-slate-800 dark:text-slate-200 text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2 shadow-2xs"
+                    >
+                      <span>💬</span>
+                      <span>Go to My Chats & Friends</span>
+                    </button>
                   </div>
+                ) : (
+                  <>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/80 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-300 text-xs font-semibold">
+                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                        <span>Private matching active</span>
+                      </div>
 
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
-                    <svg className="w-3.5 h-3.5 text-emerald-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-                    </svg>
-                    <span className="truncate">Leave anytime</span>
-                  </div>
+                      <span className="inline-flex items-center px-2.5 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-[11px] font-bold">
+                        18+ community
+                      </span>
+                    </div>
 
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
-                    <svg className="w-3.5 h-3.5 text-amber-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 21v-4m0 0V5a2 2 0 012-2h6.5l1 1H21l-3 6 3 6h-8.5l-1-1H5a2 2 0 00-2 2zm9-13.5V9" />
-                    </svg>
-                    <span className="truncate">Report & block</span>
-                  </div>
+                    <div className="space-y-3">
+                      <h2 className="text-3xl sm:text-4xl lg:text-[42px] font-black text-slate-900 dark:text-white tracking-tight leading-[1.15]">
+                        Meet someone new, without the pressure.
+                      </h2>
+                      <p className="text-slate-600 dark:text-slate-300 text-sm sm:text-base leading-relaxed">
+                        Choose a few signals and we&apos;ll introduce you to someone who wants the same kind of conversation. No profiles, no pressure, leave whenever.
+                      </p>
+                    </div>
 
-                  <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
-                    <svg className="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                    </svg>
-                    <span className="truncate">Session memory</span>
-                  </div>
-                </div>
+                    {/* Soft First Conversation Preview */}
+                    <div className="hidden sm:block p-4 sm:p-5 rounded-3xl bg-slate-50/80 dark:bg-slate-800/40 border border-slate-200/70 dark:border-slate-800 space-y-3">
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 flex items-center justify-between">
+                        <span>What a first chat looks like</span>
+                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold lowercase">matched on music</span>
+                      </div>
+
+                      <div className="flex items-start gap-2.5">
+                        {renderAvatar("River", "w-7 h-7 text-xs")}
+                        <div className="bg-white dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs px-3.5 py-2 rounded-2xl rounded-tl-xs shadow-2xs max-w-[85%]">
+                          Hey there! What kind of music are you listening to tonight?
+                        </div>
+                      </div>
+
+                      <div className="flex items-end justify-end gap-2.5">
+                        <div className="bg-[#5b4df2] text-white text-xs px-3.5 py-2 rounded-2xl rounded-tr-xs shadow-2xs max-w-[85%]">
+                          A lot of mellow indie. Trying to build a rainy-day playlist 🌧️
+                        </div>
+                      </div>
+
+                      <div className="flex items-start gap-2.5">
+                        {renderAvatar("River", "w-7 h-7 text-xs")}
+                        <div className="bg-white dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs px-3.5 py-2 rounded-2xl rounded-tl-xs shadow-2xs max-w-[85%]">
+                          Indie folk is the best for that. Have you heard the new Fleet Foxes?
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Trust and Safety Commitments (Compact 2x2 Grid) */}
+                    <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-700 dark:text-slate-300 font-medium pt-1">
+                      <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                        <svg className="w-3.5 h-3.5 text-[#5b4df2] shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                        </svg>
+                        <span className="truncate">Anonymous by default</span>
+                      </div>
+
+                      <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                        <svg className="w-3.5 h-3.5 text-emerald-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                        </svg>
+                        <span className="truncate">Leave anytime</span>
+                      </div>
+
+                      <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                        <svg className="w-3.5 h-3.5 text-amber-500 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M3 21v-4m0 0V5a2 2 0 012-2h6.5l1 1H21l-3 6 3 6h-8.5l-1-1H5a2 2 0 00-2 2zm9-13.5V9" />
+                        </svg>
+                        <span className="truncate">Report & block</span>
+                      </div>
+
+                      <div className="flex items-center gap-2 p-2.5 rounded-2xl bg-white dark:bg-slate-800/70 border border-slate-200/70 dark:border-slate-700/60 truncate">
+                        <svg className="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        <span className="truncate">Session memory</span>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* Right Column: "Set your signal" Card */}
@@ -2955,100 +3092,73 @@ export default function Home() {
                     </div>
                   </div>
 
-                  {/* Step 1: Nickname (or Read-only Member Identity chip) */}
-                  <div className={`space-y-2 ${mobileStep !== 1 ? "hidden md:block" : ""}`}>
-                    {currentMember ? (
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-slate-800 dark:text-slate-200 block">
-                          Connected Identity
+                  {/* Step 1: Guest Nickname Input (Bypassed completely for members) */}
+                  {!currentMember && (
+                    <div className={`space-y-2 ${mobileStep !== 1 ? "hidden md:block" : ""}`}>
+                      <div className="flex items-center justify-between">
+                        <label htmlFor="nickname-input" className="text-xs font-semibold text-slate-800 dark:text-slate-200 block">
+                          How should we call you?
                         </label>
-                        <div className="flex items-center justify-between p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/80 border border-slate-200/80 dark:border-slate-700">
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            {renderAvatar(currentMember.handle, "w-8 h-8 text-xs")}
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-1.5">
-                                <span className="text-xs font-bold text-slate-900 dark:text-white truncate">@{currentMember.handle}</span>
-                                <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-indigo-50 dark:bg-indigo-950 text-[#5b4df2] font-semibold">Member</span>
-                              </div>
-                              <p className="text-[10px] text-slate-400 truncate">Verified handle</p>
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => openClaimHandleModal(currentMember.handle)}
-                            className="text-xs font-semibold text-[#5b4df2] dark:text-indigo-400 hover:underline px-2.5 py-1 rounded-lg hover:bg-indigo-50 dark:hover:bg-indigo-950/50 cursor-pointer"
-                          >
-                            Change
-                          </button>
-                        </div>
+                        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Not your real name
+                        </span>
                       </div>
-                    ) : (
-                      <>
-                        <div className="flex items-center justify-between">
-                          <label htmlFor="nickname-input" className="text-xs font-semibold text-slate-800 dark:text-slate-200 block">
-                            How should we call you?
-                          </label>
-                          <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                            Not your real name
-                          </span>
+
+                      <div className="flex items-center gap-2">
+                        <div className="relative flex-1">
+                          <input
+                            id="nickname-input"
+                            type="text"
+                            className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/80 text-base text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-[#5b4df2] focus:bg-white dark:focus:bg-slate-800 transition-all min-h-[44px]"
+                            placeholder="e.g. Clover"
+                            value={nick}
+                            maxLength={20}
+                            onChange={(e) => handleGuestNickChange(e.target.value)}
+                          />
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <div className="relative flex-1">
-                            <input
-                              id="nickname-input"
-                              type="text"
-                              className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/80 text-base text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-[#5b4df2] focus:bg-white dark:focus:bg-slate-800 transition-all min-h-[44px]"
-                              placeholder="e.g. Clover"
-                              value={nick}
-                              maxLength={20}
-                              onChange={(e) => handleGuestNickChange(e.target.value)}
-                            />
-                          </div>
+                        <button
+                          type="button"
+                          onClick={shuffleNickname}
+                          className="px-3.5 py-3 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer min-h-[44px]"
+                          title="Shuffle anonymous name"
+                          aria-label="Shuffle anonymous name"
+                        >
+                          <span>🎲</span>
+                          <span className="hidden sm:inline">Shuffle</span>
+                        </button>
+                      </div>
 
-                          <button
-                            type="button"
-                            onClick={shuffleNickname}
-                            className="px-3.5 py-3 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer min-h-[44px]"
-                            title="Shuffle anonymous name"
-                            aria-label="Shuffle anonymous name"
-                          >
-                            <span>🎲</span>
-                            <span className="hidden sm:inline">Shuffle</span>
-                          </button>
-                        </div>
+                      {guestNickWarning && (
+                        <p className="text-xs text-rose-500 font-semibold flex items-center gap-1.5 pt-0.5">
+                          <span>⚠️</span>
+                          <span>{guestNickWarning}</span>
+                        </p>
+                      )}
 
-                        {guestNickWarning && (
-                          <p className="text-xs text-rose-500 font-semibold flex items-center gap-1.5 pt-0.5">
-                            <span>⚠️</span>
-                            <span>{guestNickWarning}</span>
-                          </p>
-                        )}
+                      <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                        <span>Visible only to your match during chat.</span>
+                        <button
+                          type="button"
+                          onClick={() => openClaimHandleModal(nick)}
+                          className="text-[#5b4df2] hover:underline font-semibold cursor-pointer"
+                        >
+                          Keep this name? Sign in
+                        </button>
+                      </div>
 
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
-                          <span>Visible only to your match during chat.</span>
-                          <button
-                            type="button"
-                            onClick={() => openClaimHandleModal(nick)}
-                            className="text-[#5b4df2] hover:underline font-semibold cursor-pointer"
-                          >
-                            Keep this name? Sign in
-                          </button>
-                        </div>
-                      </>
-                    )}
-
-                    <div className="block md:hidden pt-2">
-                      <button
-                        type="button"
-                        onClick={() => setMobileStep(2)}
-                        className="w-full py-3.5 px-4 rounded-xl bg-[#5b4df2] text-white font-semibold text-sm shadow-md transition-all min-h-[44px] flex items-center justify-center gap-2"
-                      >
-                        <span>Next: Pick Topics</span>
-                        <span>→</span>
-                      </button>
+                      <div className="block md:hidden pt-2">
+                        <button
+                          type="button"
+                          onClick={() => setMobileStep(2)}
+                          className="w-full py-3.5 px-4 rounded-xl bg-[#5b4df2] text-white font-semibold text-sm shadow-md transition-all min-h-[44px] flex items-center justify-center gap-2"
+                        >
+                          <span>Next: Pick Topics</span>
+                          <span>→</span>
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
 
                   {/* Step 2: Topics Selection */}
                   <div className={`space-y-2.5 ${mobileStep !== 2 ? "hidden md:block" : ""}`}>
@@ -3217,28 +3327,30 @@ export default function Home() {
                     </div>
                   </div>
 
-                  {/* 18+ Mandatory Confirmation Checkbox */}
-                  <div className={`pt-1 ${mobileStep !== 3 ? "hidden md:block" : ""}`}>
-                    <label className="flex items-center gap-2.5 text-xs text-slate-700 dark:text-slate-300 cursor-pointer select-none">
-                      <input
-                        type="checkbox"
-                        checked={isAgeConfirmed}
-                        onChange={(e) => {
-                          const val = e.target.checked;
-                          setIsAgeConfirmed(val);
-                          if (typeof window !== "undefined") {
-                            if (val) {
-                              localStorage.setItem("dusk_terms_confirmed_v1", new Date().toISOString());
-                            } else {
-                              localStorage.removeItem("dusk_terms_confirmed_v1");
+                  {/* 18+ Mandatory Confirmation Checkbox (Only for guests; members confirmed at signup) */}
+                  {!currentMember && (
+                    <div className={`pt-1 ${mobileStep !== 3 ? "hidden md:block" : ""}`}>
+                      <label className="flex items-center gap-2.5 text-xs text-slate-700 dark:text-slate-300 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={isAgeConfirmed}
+                          onChange={(e) => {
+                            const val = e.target.checked;
+                            setIsAgeConfirmed(val);
+                            if (typeof window !== "undefined") {
+                              if (val) {
+                                localStorage.setItem("dusk_terms_confirmed_v1", new Date().toISOString());
+                              } else {
+                                localStorage.removeItem("dusk_terms_confirmed_v1");
+                              }
                             }
-                          }
-                        }}
-                        className="w-4 h-4 rounded text-[#5b4df2] accent-[#5b4df2] cursor-pointer shrink-0"
-                      />
-                      <span>I confirm I am <strong>18+</strong> and agree to the Community Guidelines.</span>
-                    </label>
-                  </div>
+                          }}
+                          className="w-4 h-4 rounded text-[#5b4df2] accent-[#5b4df2] cursor-pointer shrink-0"
+                        />
+                        <span>I confirm I am <strong>18+</strong> and agree to the Community Guidelines.</span>
+                      </label>
+                    </div>
+                  )}
 
                   {/* Primary CTA Area */}
                   <div className={`space-y-3 pt-1 ${mobileStep !== 3 ? "hidden md:block" : ""}`}>
@@ -3263,7 +3375,7 @@ export default function Home() {
 
                       <button
                         onClick={() => find()}
-                        disabled={!isAgeConfirmed}
+                        disabled={!currentMember && !isAgeConfirmed}
                         className="flex-1 py-3.5 px-4 rounded-xl bg-[#5b4df2] hover:bg-[#4d3fe0] disabled:opacity-40 disabled:hover:bg-[#5b4df2] text-white font-semibold text-sm tracking-wide shadow-md shadow-[#5b4df2]/25 transition-all cursor-pointer flex items-center justify-center gap-2 min-h-[44px] active:scale-[0.98]"
                       >
                         <span>Find my conversation</span>
@@ -3271,28 +3383,16 @@ export default function Home() {
                       </button>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => setPhase("history")}
-                      className="w-full py-2.5 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/80 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[40px]"
-                    >
-                      <span>👥</span>
-                      <span>Talk to a friend or search @handle instead →</span>
-                    </button>
-
-                    {/* Continuing path indicator */}
-                    <div className="text-center pt-1">
-                      {currentMember ? (
-                        <div className="text-xs text-indigo-700 dark:text-indigo-300 font-medium flex items-center justify-center gap-1.5">
-                          <span>🔒</span>
-                          <span>Entering as verified Member <strong>(@{currentMember.handle})</strong></span>
-                        </div>
-                      ) : (
-                        <div className="flex items-center justify-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
-                          <span>Default: <strong>Continue as guest</strong> (one-time name)</span>
-                        </div>
-                      )}
-                    </div>
+                    {!currentMember && (
+                      <button
+                        type="button"
+                        onClick={() => setPhase("history")}
+                        className="w-full py-2.5 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/80 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[40px]"
+                      >
+                        <span>👥</span>
+                        <span>Talk to a friend or search @handle instead →</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -3977,7 +4077,7 @@ export default function Home() {
                 className="w-full h-full object-cover"
               />
 
-              {!remoteHasVideo && (
+              {!remoteHasVideo && !remoteStream && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#141824] space-y-3">
                   <div className="relative w-24 h-24">
                     {renderAvatar(partner, "w-24 h-24 text-3xl")}
