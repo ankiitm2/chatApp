@@ -305,6 +305,71 @@ export default function Home() {
   const [showChatInVideo, setShowChatInVideo] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
 
+  // PWA Standalone & Install Prompt State (removes browser navigation/URL bar)
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<any>(null);
+  const [isStandalone, setIsStandalone] = useState(false);
+  const [showInstallBanner, setShowInstallBanner] = useState(false);
+  const [showIosInstallModal, setShowIosInstallModal] = useState(false);
+  const [isIos, setIsIos] = useState(false);
+
+  // Detect PWA standalone mode and listen for install prompt
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const checkStandalone = () => {
+      const isStandaloneMode =
+        window.matchMedia("(display-mode: standalone)").matches ||
+        (window.navigator as any).standalone === true ||
+        document.referrer.includes("android-app://");
+      setIsStandalone(isStandaloneMode);
+      return isStandaloneMode;
+    };
+
+    const standalone = checkStandalone();
+    const userAgent = window.navigator.userAgent.toLowerCase();
+    const isIosDevice = /iphone|ipad|ipod/.test(userAgent);
+    setIsIos(isIosDevice);
+
+    if (!standalone) {
+      const dismissed = localStorage.getItem("dusk_pwa_dismissed");
+      if (!dismissed) {
+        setShowInstallBanner(true);
+      }
+    }
+
+    const handleBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(e);
+      const dismissed = localStorage.getItem("dusk_pwa_dismissed");
+      if (!dismissed) {
+        setShowInstallBanner(true);
+      }
+    };
+
+    window.addEventListener("beforeinstallprompt", handleBeforeInstall);
+
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handleBeforeInstall);
+    };
+  }, []);
+
+  const handleInstallApp = async () => {
+    if (deferredInstallPrompt) {
+      try {
+        await deferredInstallPrompt.prompt();
+        const choice = await deferredInstallPrompt.userChoice;
+        if (choice?.outcome === "accepted") {
+          setShowInstallBanner(false);
+          setDeferredInstallPrompt(null);
+        }
+      } catch (err) {
+        console.error("Install prompt error:", err);
+      }
+    } else {
+      setShowIosInstallModal(true);
+    }
+  };
+
   // Initialize theme from system or saved preference
   useEffect(() => {
     const saved = localStorage.getItem("qs_theme");
@@ -2497,6 +2562,124 @@ export default function Home() {
         </div>
       )}
 
+      {/* PWA / Standalone App Installation Guide Modal */}
+      {showIosInstallModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in"
+        >
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-4 shadow-2xl animate-in zoom-in-95">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">📱</span>
+                <h3 className="font-bold text-slate-900 dark:text-white text-sm">
+                  Remove Browser Bar
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowIosInstallModal(false)}
+                className="w-7 h-7 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 flex items-center justify-center text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+              Installing Dusk as a Web App removes the mobile address/search bar and navigation controls, giving you a 100% full-screen native app experience:
+            </p>
+
+            <div className="bg-slate-50 dark:bg-slate-800/70 p-3.5 rounded-2xl border border-slate-200/80 dark:border-slate-800 text-xs text-slate-700 dark:text-slate-200 space-y-2.5">
+              {isIos ? (
+                <>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-[#5b4df2] text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">1</span>
+                    <p>Tap the <strong>Share</strong> button <span className="inline-block px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 font-mono text-[10px]">⎙</span> at the bottom of Safari.</p>
+                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-[#5b4df2] text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">2</span>
+                    <p>Scroll down the share sheet and tap <strong>Add to Home Screen</strong>.</p>
+                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-[#5b4df2] text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">3</span>
+                    <p>Tap <strong>Add</strong> in the top right corner.</p>
+                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-emerald-500 text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
+                    <p>Open <strong>Dusk</strong> from your Home Screen to chat with zero browser bars!</p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-[#5b4df2] text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">1</span>
+                    <p>Tap the <strong>three dots menu (⋮)</strong> in Chrome or your browser bar.</p>
+                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-[#5b4df2] text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">2</span>
+                    <p>Tap <strong>Install App</strong> or <strong>Add to Home screen</strong>.</p>
+                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-[#5b4df2] text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">3</span>
+                    <p>Confirm <strong>Install</strong> when prompted.</p>
+                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-full bg-emerald-500 text-white flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
+                    <p>Launch <strong>Dusk</strong> from your app drawer for the full-screen native app!</p>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowIosInstallModal(false)}
+              className="w-full py-2.5 bg-[#5b4df2] hover:bg-[#4d3fe0] text-white rounded-xl font-semibold text-xs transition-colors cursor-pointer min-h-[42px]"
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* PWA Install Banner (to remove browser bar on mobile / desktop) */}
+      {showInstallBanner && !isStandalone && (
+        <aside aria-label="Install App" className="bg-gradient-to-r from-[#141334] via-[#211d4d] to-[#141334] border-b border-indigo-500/30 px-3 sm:px-6 py-2 flex items-center justify-between text-xs backdrop-blur-md sticky top-0 z-40 shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0 mr-2">
+            <span className="text-base shrink-0">📱</span>
+            <div className="min-w-0">
+              <span className="font-bold text-white block sm:inline">Install Dusk App:</span>{" "}
+              <span className="text-indigo-200/90 text-[11px] sm:text-xs">
+                Fullscreen experience without the mobile browser bar.
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleInstallApp}
+              className="px-3 py-1 rounded-lg bg-[#5b4df2] hover:bg-[#4d3fe0] text-white font-semibold text-xs shadow-xs transition-colors cursor-pointer"
+            >
+              Install
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowInstallBanner(false);
+                if (typeof window !== "undefined") {
+                  localStorage.setItem("dusk_pwa_dismissed", "true");
+                }
+              }}
+              className="p-1 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white transition-colors cursor-pointer text-xs"
+              aria-label="Dismiss banner"
+            >
+              ✕
+            </button>
+          </div>
+        </aside>
+      )}
+
       {/* ========================================================
           1. SETUP / WELCOME BOARD PHASE (Image 1 Refined)
       ======================================================== */}
@@ -2544,6 +2727,18 @@ export default function Home() {
                 ) : null}
               </button>
 
+              {!isStandalone && (
+                <button
+                  type="button"
+                  onClick={handleInstallApp}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-800/80 bg-indigo-50/70 hover:bg-indigo-100 dark:bg-indigo-950/40 dark:hover:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 text-xs font-semibold transition-colors cursor-pointer min-h-[36px]"
+                  title="Install Dusk as standalone app without browser bars"
+                >
+                  <span>📱</span>
+                  <span className="hidden sm:inline">Install App</span>
+                </button>
+              )}
+
               {/* Account / Auth Button or Compact Avatar Dropdown */}
               {currentMember ? (
                 <div className="relative">
@@ -2580,6 +2775,16 @@ export default function Home() {
                       >
                         Privacy & Discovery
                       </button>
+                      {!isStandalone && (
+                        <button
+                          type="button"
+                          onClick={() => { setAccountMenuOpen(false); handleInstallApp(); }}
+                          className="w-full text-left px-2.5 py-2 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 rounded-xl transition-colors cursor-pointer flex items-center justify-between"
+                        >
+                          <span>📱 Install App</span>
+                          <span className="text-[9px] bg-indigo-100 dark:bg-indigo-900/60 px-1 py-0.5 rounded text-indigo-700 dark:text-indigo-300">No URL bar</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => { setAccountMenuOpen(false); handleLogout(); }}
@@ -3217,6 +3422,18 @@ export default function Home() {
             </div>
 
             <div className="flex items-center gap-3">
+              {!isStandalone && (
+                <button
+                  type="button"
+                  onClick={handleInstallApp}
+                  className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-indigo-200 dark:border-indigo-800/80 bg-indigo-50/70 hover:bg-indigo-100 dark:bg-indigo-950/40 dark:hover:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 text-xs font-semibold transition-colors cursor-pointer min-h-[40px]"
+                  title="Install Dusk as standalone app without browser bars"
+                >
+                  <span>📱</span>
+                  <span>Install App</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={toggleTheme}
@@ -4127,6 +4344,23 @@ export default function Home() {
                       Log out
                     </button>
                   </div>
+                )}
+
+                {!isStandalone && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileDrawerOpen(false);
+                      handleInstallApp();
+                    }}
+                    className="w-full p-2.5 rounded-2xl bg-indigo-50/80 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-800/60 flex items-center justify-between text-indigo-700 dark:text-indigo-300 text-xs font-semibold cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <span>📱</span>
+                      <span>Install App</span>
+                    </span>
+                    <span className="text-[10px] bg-indigo-100 dark:bg-indigo-900/60 px-1.5 py-0.5 rounded text-indigo-800 dark:text-indigo-200 font-bold">No browser bar</span>
+                  </button>
                 )}
 
                 <div className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700/60 space-y-1">

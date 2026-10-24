@@ -53,6 +53,36 @@ setInterval(() => {
   }
 }, 30000);
 
+// In-memory rate limiting map for message spam prevention
+const messageRateMap = new Map();
+function checkRateLimit(socketId, maxPerWindow = 12, windowMs = 3000) {
+  const now = Date.now();
+  let entry = messageRateMap.get(socketId);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 1, resetAt: now + windowMs };
+    messageRateMap.set(socketId, entry);
+    return true;
+  }
+  entry.count++;
+  return entry.count <= maxPerWindow;
+}
+
+function sanitizePayload(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const type = ["text", "image", "audio", "sticker"].includes(raw.type) ? raw.type : "text";
+  const text = typeof raw.text === "string" ? raw.text.slice(0, 2000) : "";
+  let mediaUrl = undefined;
+  if (typeof raw.mediaUrl === "string") {
+    if (raw.mediaUrl.length <= 5 * 1024 * 1024) {
+      mediaUrl = raw.mediaUrl;
+    }
+  }
+  const id = typeof raw.id === "string" ? raw.id.slice(0, 64) : ("m_" + Date.now());
+  const toHandle = typeof raw.toHandle === "string" ? raw.toHandle.slice(0, 32) : undefined;
+  const time = typeof raw.time === "string" ? raw.time.slice(0, 16) : undefined;
+  return { id, type, text, mediaUrl, toHandle, time };
+}
+
 const dequeue = (id) => {
   const i = waiting.findIndex((w) => w.id === id);
   if (i > -1) waiting.splice(i, 1);
@@ -68,15 +98,29 @@ const unpair = (id) => {
 };
 
 function match(me) {
-  const shares = (w) => w.interests.some((i) => me.interests.includes(i));
-  let idx = waiting.findIndex((w) => w.id !== me.id && shares(w));
-  if (idx < 0) idx = waiting.findIndex((w) => w.id !== me.id);
-  if (idx < 0) {
+  let other = null;
+  while (waiting.length > 0) {
+    const shares = (w) => w.interests.some((i) => me.interests.includes(i));
+    let idx = waiting.findIndex((w) => w.id !== me.id && shares(w));
+    if (idx < 0) idx = waiting.findIndex((w) => w.id !== me.id);
+    if (idx < 0) break;
+
+    const [candidate] = waiting.splice(idx, 1);
+    const candidateSocket = io.sockets.sockets.get(candidate.id);
+    // Discard candidate if disconnected or already paired
+    if (!candidateSocket || !candidateSocket.connected || partners.has(candidate.id)) {
+      continue;
+    }
+    other = candidate;
+    break;
+  }
+
+  if (!other) {
     waiting.push(me);
     io.to(me.id).emit("waiting");
     return;
   }
-  const [other] = waiting.splice(idx, 1);
+
   partners.set(me.id, other.id);
   partners.set(other.id, me.id);
   const common = me.interests.filter((i) => other.interests.includes(i));
@@ -188,17 +232,24 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("message", (payload) => {
+  socket.on("message", (rawPayload) => {
+    if (!checkRateLimit(socket.id)) {
+      socket.emit("direct-chat-error", { message: "Slow down! Sending messages too quickly." });
+      return;
+    }
+    const payload = sanitizePayload(rawPayload);
+    if (!payload) return;
+
     const p = partners.get(socket.id);
     let delivered = false;
 
-    if (p && payload) {
+    if (p) {
       io.to(p).emit("message", payload);
       delivered = true;
     }
 
     // Direct real-time routing for friend / past conversation messages
-    if (payload && typeof payload === "object" && payload.toHandle) {
+    if (payload.toHandle) {
       const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
       const target = onlineUsers.get(norm);
       if (target && target.socketId && target.socketId !== socket.id && target.socketId !== p) {
@@ -208,8 +259,7 @@ io.on("connection", (socket) => {
     }
 
     // Inform sender that message was delivered to recipient's active socket
-    if (delivered && payload && typeof payload === "object" && payload.id) {
-      // Recipient will send explicit message-ack, but for transient stranger sockets acknowledge delivery:
+    if (delivered && payload.id) {
       if (p) {
         socket.emit("message-delivered", {
           messageId: payload.id,
@@ -256,8 +306,14 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("direct-message", (payload) => {
+  socket.on("direct-message", (rawPayload) => {
+    if (!checkRateLimit(socket.id)) {
+      socket.emit("direct-chat-error", { message: "Slow down! Sending messages too quickly." });
+      return;
+    }
+    const payload = sanitizePayload(rawPayload);
     if (!payload || !payload.toHandle) return;
+
     const norm = String(payload.toHandle).toLowerCase().trim().replace(/^@/, "");
     const target = onlineUsers.get(norm);
     const senderNorm = socketToUser.get(socket.id);
@@ -427,6 +483,7 @@ io.on("connection", (socket) => {
   const leave = () => {
     unpair(socket.id);
     dequeue(socket.id);
+    messageRateMap.delete(socket.id);
     for (const [id, inv] of pendingInvites.entries()) {
       if (inv.fromSocketId === socket.id || inv.toSocketId === socket.id) {
         pendingInvites.delete(id);

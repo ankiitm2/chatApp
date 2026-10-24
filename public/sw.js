@@ -1,4 +1,4 @@
-// Service Worker for Quiet Signal PWA & Background Notifications
+// Service Worker for Dusk PWA & Background Notifications
 self.addEventListener("install", (event) => {
   self.skipWaiting();
 });
