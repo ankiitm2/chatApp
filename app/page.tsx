@@ -183,7 +183,8 @@ export default function Home() {
   const [isDirectChat, setIsDirectChat] = useState(false);
   const [showPrivacySettingsModal, setShowPrivacySettingsModal] = useState(false);
   const [partnerStyle, setPartnerStyle] = useState<ConversationStyle>("text");
-  const [common, setCommon] = useState<string[]>(["Music"]);
+  const [common, setCommon] = useState<string[]>([]);
+  const [allowFallbackMatch, setAllowFallbackMatch] = useState(true);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [draft, setDraft] = useState("");
   const [onlineCount, setOnlineCount] = useState(3842);
@@ -710,7 +711,7 @@ export default function Home() {
         setPartnerHandle(d.handle || null);
         setIsDirectChat(!!d.isDirect);
         setFriendStatus("none");
-        setCommon(d.common && d.common.length > 0 ? d.common : selectedTopics.slice(0, 1));
+        setCommon(Array.isArray(d.common) ? d.common : []);
         setMsgs([]);
         setPhase("chat");
 
@@ -1289,6 +1290,7 @@ export default function Home() {
       isMember: !!activeMember?.isMember,
       handle: activeMember?.handle || null,
       region: chosenRegion,
+      allowFallback: allowFallbackMatch,
     });
   };
 
@@ -3121,6 +3123,18 @@ export default function Home() {
                           {topicInputError}
                         </p>
                       )}
+
+                      <label className="flex items-center gap-2 pt-1 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={allowFallbackMatch}
+                          onChange={(e) => setAllowFallbackMatch(e.target.checked)}
+                          className="w-4 h-4 rounded text-[#5b4df2] focus:ring-indigo-500 border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                        />
+                        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Allow fallback to anyone online if no exact topic match
+                        </span>
+                      </label>
                     </div>
 
                     <div className="flex md:hidden items-center gap-2 pt-2">
@@ -4067,9 +4081,11 @@ export default function Home() {
                 <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
                   Shared Signal
                 </span>
-                <div className="text-xs font-bold text-white">{common[0] || "Music"}</div>
+                <div className="text-xs font-bold text-white">{common.length > 0 ? common[0] : "Open Match"}</div>
                 <p className="text-[11px] text-slate-400 leading-relaxed">
-                  You both picked {common[0] || "Music"} as a conversation starter.
+                  {common.length > 0
+                    ? `You both picked ${common[0]} as a conversation starter.`
+                    : "Paired via open matching. Start the conversation with an icebreaker below."}
                 </p>
               </div>
 
@@ -4217,7 +4233,7 @@ export default function Home() {
                         </div>
                       </div>
                       <p className="text-[11px] text-slate-600 dark:text-slate-300 font-semibold truncate mt-0.5">
-                        {msgs.length > 0 ? (msgs[msgs.length - 1].type === "image" ? "📷 Sent a photo" : msgs[msgs.length - 1].type === "audio" ? "🎙️ Voice message" : msgs[msgs.length - 1].text) : "Matched on " + (common[0] || "Music")}
+                        {msgs.length > 0 ? (msgs[msgs.length - 1].type === "image" ? "📷 Sent a photo" : msgs[msgs.length - 1].type === "audio" ? "🎙️ Voice message" : msgs[msgs.length - 1].text) : (common.length > 0 ? `Matched on ${common[0]}` : "Open conversation")}
                       </p>
                     </div>
                   </div>
@@ -4399,7 +4415,7 @@ export default function Home() {
                       <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
                     </div>
                     <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-tight">
-                      Matched on {common[0] || "Music"}{partnerLocation ? ` · ${partnerLocation}` : ""}
+                      {common.length > 0 ? `Matched on ${common[0]}` : "Open connection"}{partnerLocation ? ` · ${partnerLocation}` : ""}
                     </p>
                   </div>
                 </div>
@@ -4450,7 +4466,7 @@ export default function Home() {
               <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-4 bg-[#fafafa] dark:bg-[#0b0f19]">
                 <div className="text-center my-2">
                   <span className="text-[11px] text-slate-500 dark:text-slate-400 px-3.5 py-1 rounded-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-2xs font-medium">
-                    Matched on {common[0] || "Music"} · Temporary session memory
+                    {common.length > 0 ? `Matched on ${common[0]}` : "Open conversation"} · Temporary session memory
                   </span>
                 </div>
 
@@ -4799,7 +4815,7 @@ export default function Home() {
                     Shared Signal
                   </span>
                   <div className="text-xs font-bold text-slate-900 dark:text-white">
-                    {common[0] || "Music"}
+                    {common.length > 0 ? common[0] : "Open Connection"}
                   </div>
                 </div>
 

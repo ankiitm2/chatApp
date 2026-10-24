@@ -102,7 +102,9 @@ function match(me) {
   while (waiting.length > 0) {
     const shares = (w) => w.interests.some((i) => me.interests.includes(i));
     let idx = waiting.findIndex((w) => w.id !== me.id && shares(w));
-    if (idx < 0) idx = waiting.findIndex((w) => w.id !== me.id);
+    if (idx < 0 && me.allowFallback !== false) {
+      idx = waiting.findIndex((w) => w.id !== me.id && w.allowFallback !== false);
+    }
     if (idx < 0) break;
 
     const [candidate] = waiting.splice(idx, 1);
@@ -124,6 +126,7 @@ function match(me) {
   partners.set(me.id, other.id);
   partners.set(other.id, me.id);
   const common = me.interests.filter((i) => other.interests.includes(i));
+  const isFallback = common.length === 0;
   io.to(me.id).emit("matched", {
     nick: other.nick,
     gender: other.gender,
@@ -133,6 +136,7 @@ function match(me) {
     handle: other.handle || null,
     region: other.region || null,
     common,
+    isFallback,
     isInitiator: true,
     isDirect: false,
   });
@@ -145,6 +149,7 @@ function match(me) {
     handle: me.handle || null,
     region: me.region || null,
     common,
+    isFallback,
     isInitiator: false,
     isDirect: false,
   });
@@ -156,7 +161,7 @@ io.on("connection", (socket) => {
   onlineCount++;
   io.emit("online-count", onlineCount);
 
-  socket.on("find", ({ nick, gender, interests, style, isMember, handle, region }) => {
+  socket.on("find", ({ nick, gender, interests, style, isMember, handle, region, allowFallback }) => {
     unpair(socket.id);
     dequeue(socket.id);
     const clean = (Array.isArray(interests) ? interests : [])
@@ -173,6 +178,7 @@ io.on("connection", (socket) => {
       isMember: !!isMember,
       handle: handle ? String(handle).trim().replace(/^@/, "").slice(0, 20) : null,
       region: region ? String(region).slice(0, 40) : null,
+      allowFallback: allowFallback !== false,
     });
   });
 
